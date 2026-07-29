@@ -6,14 +6,26 @@ from datetime import datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from .api import TossClient
+from .api import TossApiError, TossClient
 from .broker import LiveBroker, PaperBroker
 from .config import Settings
 from .state import PortfolioState, Position
+from .reconciliation import SyncStatus, parse_account_snapshot, reconcile_portfolio
 from .strategy import MomentumSignal, analyze_candidate, exit_reason, position_quantity
 
 
 KST = timezone(timedelta(hours=9))
+ACCOUNT_ORDER_ERROR_CODES = {
+    "account-restricted",
+    "investor-exchange-not-integrated",
+    "prerequisite-required",
+}
+SYMBOL_ORDER_ERROR_CODES = {
+    "stock-restricted",
+    "market-not-supported-for-stock",
+    "price-out-of-range",
+    "order-type-not-allowed",
+}
 
 
 def configure_logging(project_root: Path) -> logging.Logger:
@@ -58,6 +70,36 @@ class TradingEngine:
         self.broker = (
             LiveBroker(client) if settings.mode == "live" else PaperBroker()
         )
+        if settings.mode == "live":
+            self._sync_live_account(today)
+
+    def _sync_live_account(self, trading_day: str) -> None:
+        self.state.sync_status = SyncStatus.IN_PROGRESS.value
+        self.state.sync_reason = None
+        self.state.save(self.settings.state_path)
+        try:
+            snapshot = parse_account_snapshot(
+                self.client.holdings(),
+                self.client.pending_orders(),
+                self.client.buying_power(),
+            )
+            reasons = reconcile_portfolio(
+                self.state, snapshot, trading_day=trading_day
+            )
+            if reasons:
+                self.logger.warning(
+                    "LIVE account reconciliation degraded: reasons=%s",
+                    ",".join(reasons),
+                )
+            else:
+                self.logger.info("LIVE account reconciliation succeeded")
+        except Exception as exc:
+            self.state.sync_status = SyncStatus.FAILED.value
+            self.state.sync_reason = f"sync_failed:{type(exc).__name__}"
+            self.state.entries_halted = True
+            self.state.halt_reason = "account_sync_failed"
+            self.logger.exception("LIVE account reconciliation failed")
+        self.state.save(self.settings.state_path)
 
     def _entry_window_open(self, now: datetime) -> bool:
         current = now.timetz()
@@ -184,6 +226,8 @@ class TradingEngine:
             symbol = str(ranking["symbol"])
             if symbol in self.state.positions:
                 continue
+            if symbol in self.state.blocked_symbols:
+                continue
             # KR orders require whole shares. Avoid expensive candidates that
             # can never fit inside the configured per-trade ceiling.
             if Decimal(str(ranking["price"]["lastPrice"])) > self.settings.max_trade_krw:
@@ -207,18 +251,77 @@ class TradingEngine:
         equity: Decimal,
         now: datetime,
     ) -> bool:
+        reference_price = signal.price
+        if self.settings.mode == "live":
+            try:
+                orderbook = self.client.orderbook(signal.symbol)
+                asks = orderbook.get("asks", [])
+                if not asks:
+                    self._record_order_failure(signal.symbol, "no_valid_ask")
+                    return False
+                reference_price = Decimal(str(asks[0]["price"]))
+                if reference_price <= 0:
+                    self._record_order_failure(signal.symbol, "invalid_ask_price")
+                    return False
+                limits = self.client.price_limits(signal.symbol)
+                lower = Decimal(str(limits.get("lowerLimitPrice", "0")))
+                upper = Decimal(str(limits.get("upperLimitPrice", "0")))
+                if (lower > 0 and reference_price < lower) or (
+                    upper > 0 and reference_price > upper
+                ):
+                    self._record_order_failure(
+                        signal.symbol, "price_out_of_range_preflight"
+                    )
+                    return False
+            except TossApiError as exc:
+                self._record_order_failure(signal.symbol, exc.code, exc)
+                return False
+            except Exception as exc:
+                self.state.last_error = f"preflight_unknown:{type(exc).__name__}"
+                self.state.entries_halted = True
+                self.state.halt_reason = "preflight_failed"
+                self.state.save(self.settings.state_path)
+                self.logger.exception("주문 사전 검증 실패; 신규 진입을 중지합니다")
+                return False
         quantity = position_quantity(
             cash=cash,
             equity=equity,
-            price=signal.price,
+            price=reference_price,
             settings=self.settings,
         )
+        if self.settings.mode == "live":
+            quantity = min(quantity, int((cash * Decimal("0.95")) // reference_price))
         if quantity <= 0:
             self.logger.info("예산 부족으로 진입 생략: %s", signal.symbol)
             return False
-        execution = self.broker.buy(
-            signal.symbol, quantity, reference_price=signal.price
-        )
+        self.state.pending_order = {
+            "symbol": signal.symbol,
+            "side": "BUY",
+            "quantity": quantity,
+            "price": str(reference_price),
+            "created_at": now.isoformat(),
+        }
+        self.state.save(self.settings.state_path)
+        try:
+            execution = self.broker.buy(
+                signal.symbol,
+                quantity,
+                reference_price=reference_price,
+                on_submitted=self._record_order_submitted,
+            )
+        except TossApiError as exc:
+            self._record_order_failure(signal.symbol, exc.code, exc)
+            return False
+        except Exception as exc:
+            self.state.last_error = f"order_unknown:{type(exc).__name__}"
+            self.state.consecutive_errors += 1
+            self.state.entries_halted = True
+            self.state.halt_reason = "order_status_unknown"
+            self.state.save(self.settings.state_path)
+            self.logger.exception("주문 응답 불확실; 신규 진입을 중지합니다")
+            return False
+        self.state.pending_order = None
+        self.state.consecutive_errors = 0
         cost = execution.price * Decimal(execution.quantity)
         if self.settings.mode == "paper":
             if cost > self.state.cash:
@@ -250,6 +353,46 @@ class TradingEngine:
         self.state.save(self.settings.state_path)
         return True
 
+    def _record_order_submitted(self, order_id: str) -> None:
+        if self.state.pending_order is None:
+            raise RuntimeError("submitted order without a pending journal")
+        self.state.pending_order["order_id"] = order_id
+        self.state.save(self.settings.state_path)
+
+    def _record_order_failure(
+        self, symbol: str, code: str, error: TossApiError | None = None
+    ) -> None:
+        message = str(error) if error is not None else code
+        self.state.last_error = f"{code}:{message}"
+        self.state.consecutive_errors += 1
+        if self.state.pending_order and self.state.pending_order.get("order_id"):
+            self.state.entries_halted = True
+            self.state.halt_reason = "accepted_order_status_unknown"
+            self.state.save(self.settings.state_path)
+            self.logger.error(
+                "ORDER_STATUS_UNKNOWN symbol=%s code=%s order_id=%s request_id=%s",
+                symbol,
+                code,
+                self.state.pending_order["order_id"],
+                error.request_id if error else None,
+            )
+            return
+        self.state.pending_order = None
+        if code in SYMBOL_ORDER_ERROR_CODES:
+            self.state.blocked_symbols[symbol] = self.state.last_error
+        else:
+            self.state.entries_halted = True
+            self.state.halt_reason = f"order_error:{code}"
+        self.state.save(self.settings.state_path)
+        self.logger.error(
+            "ORDER_REJECTED symbol=%s code=%s status=%s request_id=%s data=%s",
+            symbol,
+            code,
+            error.status if error else None,
+            error.request_id if error else None,
+            error.data if error else None,
+        )
+
     def run_once(self, now: datetime | None = None) -> None:
         now = now or datetime.now(KST)
         self.logger.info(
@@ -269,6 +412,19 @@ class TradingEngine:
             and not self.state.positions
         ):
             self.state.roll_to_new_day(now.date().isoformat(), cash)
+
+        if self.settings.mode == "live" and self.state.sync_status != SyncStatus.SUCCEEDED.value:
+            self.logger.warning(
+                "신규 진입 중지: account_sync_status=%s reason=%s",
+                self.state.sync_status,
+                self.state.sync_reason,
+            )
+            for symbol in list(self.state.positions):
+                price = prices.get(symbol)
+                if price is not None and self._force_exit_due(now):
+                    self._sell(symbol, price, "account_sync_degraded_force_exit", now)
+            self.state.save(self.settings.state_path)
+            return
         self._daily_guard(cash, prices)
 
         if self.state.entries_halted:

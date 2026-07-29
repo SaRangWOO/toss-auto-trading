@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from toss_trader.engine import KST, TradingEngine
+from toss_trader.api import TossApiError
 from toss_trader.strategy import MomentumSignal
 
 from test_strategy import settings
@@ -58,6 +59,34 @@ class EngineTests(unittest.TestCase):
             self.assertNotIn("EXPENSIVE", engine.state.positions)
             self.assertIn("AFFORDABLE", engine.state.positions)
             self.assertEqual(engine.state.daily_entries, 1)
+            for handler in list(engine.logger.handlers):
+                handler.close()
+                engine.logger.removeHandler(handler)
+
+    def test_422_blocks_only_symbol_for_symbol_scoped_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            engine = TradingEngine(settings(Path(temporary)), FakeClient())
+            engine._record_order_failure(
+                "005930",
+                "price-out-of-range",
+                TossApiError(422, "price-out-of-range", "bad price", "req-1"),
+            )
+            self.assertIn("005930", engine.state.blocked_symbols)
+            self.assertFalse(engine.state.entries_halted)
+            for handler in list(engine.logger.handlers):
+                handler.close()
+                engine.logger.removeHandler(handler)
+
+    def test_accepted_order_status_error_keeps_journal_and_halts_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            engine = TradingEngine(settings(Path(temporary)), FakeClient())
+            engine.state.pending_order = {
+                "symbol": "005930",
+                "order_id": "o1",
+            }
+            engine._record_order_failure("005930", "temporary-error")
+            self.assertEqual(engine.state.pending_order["order_id"], "o1")
+            self.assertTrue(engine.state.entries_halted)
             for handler in list(engine.logger.handlers):
                 handler.close()
                 engine.logger.removeHandler(handler)
