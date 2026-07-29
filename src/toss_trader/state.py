@@ -45,6 +45,10 @@ class PortfolioState:
     daily_entries: int = 0
     entries_halted: bool = False
     halt_reason: str | None = None
+    sync_status: str = "NOT_STARTED"
+    sync_reason: str | None = None
+    pending_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
+    recovery_required: list[str] = field(default_factory=list)
 
     @classmethod
     def fresh(
@@ -75,6 +79,10 @@ class PortfolioState:
             daily_entries=int(raw.get("daily_entries", 0)),
             entries_halted=bool(raw.get("entries_halted", False)),
             halt_reason=raw.get("halt_reason"),
+            sync_status=str(raw.get("sync_status", "NOT_STARTED")),
+            sync_reason=raw.get("sync_reason"),
+            pending_orders=dict(raw.get("pending_orders", {})),
+            recovery_required=[str(item) for item in raw.get("recovery_required", [])],
         )
         if state.trading_day != trading_day and not state.positions:
             return cls.fresh(trading_day, state.cash)
@@ -90,6 +98,10 @@ class PortfolioState:
             "daily_entries": self.daily_entries,
             "entries_halted": self.entries_halted,
             "halt_reason": self.halt_reason,
+            "sync_status": self.sync_status,
+            "sync_reason": self.sync_reason,
+            "pending_orders": self.pending_orders,
+            "recovery_required": self.recovery_required,
             "positions": {
                 symbol: position.to_dict()
                 for symbol, position in self.positions.items()

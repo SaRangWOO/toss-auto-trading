@@ -270,6 +270,18 @@ class TossClient:
             account=True,
         )
 
+    def pending_orders(self) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET",
+            "/api/v1/orders",
+            "ORDER_HISTORY",
+            query={"status": "OPEN"},
+            account=True,
+        )
+        if isinstance(result, list):
+            return result
+        return result.get("orders", result.get("pendingOrders", []))
+
     def create_market_order(
         self,
         *,

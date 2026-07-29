@@ -10,6 +10,7 @@ from .api import TossClient
 from .broker import LiveBroker, PaperBroker
 from .config import Settings
 from .state import PortfolioState, Position
+from .reconciliation import SyncStatus, parse_account_snapshot, reconcile_portfolio
 from .strategy import MomentumSignal, analyze_candidate, exit_reason, position_quantity
 
 
@@ -58,6 +59,36 @@ class TradingEngine:
         self.broker = (
             LiveBroker(client) if settings.mode == "live" else PaperBroker()
         )
+        if settings.mode == "live":
+            self._sync_live_account(today)
+
+    def _sync_live_account(self, trading_day: str) -> None:
+        self.state.sync_status = SyncStatus.IN_PROGRESS.value
+        self.state.sync_reason = None
+        self.state.save(self.settings.state_path)
+        try:
+            snapshot = parse_account_snapshot(
+                self.client.holdings(),
+                self.client.pending_orders(),
+                self.client.buying_power(),
+            )
+            reasons = reconcile_portfolio(
+                self.state, snapshot, trading_day=trading_day
+            )
+            if reasons:
+                self.logger.warning(
+                    "LIVE account reconciliation degraded: reasons=%s",
+                    ",".join(reasons),
+                )
+            else:
+                self.logger.info("LIVE account reconciliation succeeded")
+        except Exception as exc:
+            self.state.sync_status = SyncStatus.FAILED.value
+            self.state.sync_reason = f"sync_failed:{type(exc).__name__}"
+            self.state.entries_halted = True
+            self.state.halt_reason = "account_sync_failed"
+            self.logger.exception("LIVE account reconciliation failed")
+        self.state.save(self.settings.state_path)
 
     def _entry_window_open(self, now: datetime) -> bool:
         current = now.timetz()
@@ -269,6 +300,19 @@ class TradingEngine:
             and not self.state.positions
         ):
             self.state.roll_to_new_day(now.date().isoformat(), cash)
+
+        if self.settings.mode == "live" and self.state.sync_status != SyncStatus.SUCCEEDED.value:
+            self.logger.warning(
+                "신규 진입 중지: account_sync_status=%s reason=%s",
+                self.state.sync_status,
+                self.state.sync_reason,
+            )
+            for symbol in list(self.state.positions):
+                price = prices.get(symbol)
+                if price is not None and self._force_exit_due(now):
+                    self._sell(symbol, price, "account_sync_degraded_force_exit", now)
+            self.state.save(self.settings.state_path)
+            return
         self._daily_guard(cash, prices)
 
         if self.state.entries_halted:
