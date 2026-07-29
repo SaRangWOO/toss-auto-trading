@@ -181,6 +181,7 @@ def command_verify_live_order(settings: Settings, args: argparse.Namespace) -> i
             "side": "BUY",
             "quantity": 1,
             "price": str(price),
+            "reference_price": str(price),
             "client_order_id": client_order_id,
             "created_at": datetime.now(KST).isoformat(),
         },
