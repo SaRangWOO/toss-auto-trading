@@ -1,6 +1,8 @@
 param(
-    [ValidateSet("check", "scan", "once", "run", "status")]
-    [string]$Command = "status"
+    [ValidateSet("check", "scan", "once", "run", "status", "verify-live-order")]
+    [string]$Command = "status",
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,5 +14,5 @@ if (-not (Test-Path -LiteralPath $python)) {
 }
 
 $env:PYTHONPATH = Join-Path $projectRoot "src"
-& $python -m toss_trader.cli $Command --project-root $projectRoot
+& $python -m toss_trader.cli $Command --project-root $projectRoot @Arguments
 exit $LASTEXITCODE

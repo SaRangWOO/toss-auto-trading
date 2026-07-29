@@ -68,6 +68,7 @@ class TossClient:
         self.timeout_seconds = timeout_seconds
         self._token: Token | None = None
         self._last_call: dict[str, float] = {}
+        self.retry_enabled = True
 
     def _throttle(self, group: str) -> None:
         tps = self._GROUP_TPS[group]
@@ -154,12 +155,12 @@ class TossClient:
             message = str(error_payload.get("message", raw[:300] or exc.reason))
             request_id = error_payload.get("requestId") or exc.headers.get("X-Request-Id")
             error_data = error_payload.get("data")
-            if exc.code == 401 and authenticated and retry == 0:
+            if self.retry_enabled and exc.code == 401 and authenticated and retry == 0:
                 self.issue_token(force=True)
                 return self._open(
                     request, authenticated=True, group=group, retry=retry + 1
                 )
-            if exc.code == 429 and retry < 3:
+            if self.retry_enabled and exc.code == 429 and retry < 3:
                 retry_after = float(exc.headers.get("Retry-After", 2**retry))
                 time.sleep(retry_after + random.uniform(0.05, 0.25))
                 return self._open(
@@ -168,7 +169,7 @@ class TossClient:
                     group=group,
                     retry=retry + 1,
                 )
-            if exc.code >= 500 and retry < 3:
+            if self.retry_enabled and exc.code >= 500 and retry < 3:
                 time.sleep((2**retry) + random.uniform(0.05, 0.25))
                 return self._open(
                     request,
@@ -184,7 +185,7 @@ class TossClient:
                 error_data if isinstance(error_data, dict) else None,
             ) from exc
         except urllib.error.URLError as exc:
-            if retry < 2:
+            if self.retry_enabled and retry < 2:
                 time.sleep(2**retry)
                 return self._open(
                     request,
