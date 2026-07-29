@@ -245,8 +245,14 @@ def command_verify_live_order(settings: Settings, args: argparse.Namespace) -> i
     execution = order.get("execution") or {}
     filled = int(Decimal(str(execution.get("filledQuantity", "0"))))
     print(f"ORDER_STATUS orderId={order_id} status={status} filledQuantity={filled}")
-    if status != "FILLED" or filled != 1:
+    if status in VERIFY_TERMINAL and (status != "FILLED" or filled != 1):
         _save_verify_journal(settings, None)
+        return 1
+    if status not in VERIFY_TERMINAL:
+        print(
+            f"ORDER_PENDING orderId={order_id}; journal is retained for reconciliation",
+            file=sys.stderr,
+        )
         return 1
     after = parse_account_snapshot(
         client.holdings(), client.pending_orders(), client.buying_power()
