@@ -144,7 +144,7 @@ class Settings:
         for name, value, upper in (
             ("MAX_DAILY_LOSS_RATE", self.max_daily_loss_rate, Decimal("0.03")),
             ("RISK_PER_TRADE_RATE", self.risk_per_trade_rate, Decimal("0.01")),
-            ("MAX_POSITION_RATE", self.max_position_rate, Decimal("0.20")),
+            ("MAX_POSITION_RATE", self.max_position_rate, Decimal("1.00")),
             ("STOP_LOSS_RATE", self.stop_loss_rate, Decimal("0.03")),
         ):
             if value <= 0 or value > upper:
