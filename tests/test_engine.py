@@ -50,10 +50,11 @@ class EngineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = settings(Path(temporary))
             engine = TradingEngine(config, FakeClient())
-            engine.scan = lambda: [
+            engine.scan = lambda *args, **kwargs: [
                 signal("EXPENSIVE", "200000", "10"),
                 signal("AFFORDABLE", "20000", "9"),
             ]
+            engine._fresh_entry_quote = lambda item, now: (item.price, 1000)
             engine.run_once(datetime(2026, 7, 29, 9, 30, tzinfo=KST))
             self.assertNotIn("EXPENSIVE", engine.state.positions)
             self.assertIn("AFFORDABLE", engine.state.positions)

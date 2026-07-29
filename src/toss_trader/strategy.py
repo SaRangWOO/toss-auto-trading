@@ -28,6 +28,8 @@ class MomentumSignal:
     volume_surge: Decimal
     vwap: Decimal
     spread_rate: Decimal
+    best_ask: Decimal | None = None
+    orderbook_timestamp: str | None = None
 
 
 def _return(current: Decimal, previous: Decimal) -> Decimal:
@@ -41,10 +43,26 @@ def analyze_candidate(
     candles: list[dict[str, Any]],
     orderbook: dict[str, Any],
     settings: Settings,
+    as_of: datetime | None = None,
 ) -> MomentumSignal | None:
     if len(candles) < 16:
         return None
     ordered_all = sorted(candles, key=lambda item: item["timestamp"])
+    if as_of is not None:
+        # The most recent 1-minute candle is still forming until the next
+        # minute. Using it creates false volume spikes and look-ahead bias.
+        ordered_all = [
+            item
+            for item in ordered_all
+            if datetime.fromisoformat(str(item["timestamp"]))
+            .replace(second=0, microsecond=0)
+            < as_of.replace(second=0, microsecond=0)
+        ]
+        if len(ordered_all) < 16:
+            return None
+        newest_at = datetime.fromisoformat(str(ordered_all[-1]["timestamp"]))
+        if (as_of - newest_at).total_seconds() > settings.max_data_age_seconds:
+            return None
     latest_day = datetime.fromisoformat(
         str(ordered_all[-1]["timestamp"])
     ).date()
@@ -130,7 +148,44 @@ def analyze_candidate(
         volume_surge=volume_surge,
         vwap=vwap,
         spread_rate=spread_rate,
+        best_ask=best_ask,
+        orderbook_timestamp=orderbook.get("timestamp"),
     )
+
+
+def market_regime_allows(
+    candles_by_symbol: dict[str, list[dict[str, Any]]],
+    settings: Settings,
+    as_of: datetime,
+) -> bool:
+    """Reject entries only when both Korean indices are in a sharp downswing."""
+    weak_indices = 0
+    available_indices = 0
+    for candles in candles_by_symbol.values():
+        ordered = sorted(candles, key=lambda item: item["timestamp"])
+        completed = [
+            item
+            for item in ordered
+            if datetime.fromisoformat(str(item["timestamp"]))
+            .replace(second=0, microsecond=0)
+            < as_of.replace(second=0, microsecond=0)
+        ]
+        if len(completed) < 16:
+            continue
+        newest_at = datetime.fromisoformat(str(completed[-1]["timestamp"]))
+        if (as_of - newest_at).total_seconds() > settings.max_data_age_seconds:
+            continue
+        closes = [D(item["closePrice"]) for item in completed]
+        momentum_5m = _return(closes[-1], closes[-6])
+        momentum_15m = _return(closes[-1], closes[-16])
+        available_indices += 1
+        if (
+            momentum_5m < settings.min_market_5m_rate
+            or momentum_15m < settings.min_market_15m_rate
+        ):
+            weak_indices += 1
+    # Missing or stale regime data is not treated as permission to trade.
+    return available_indices == 2 and weak_indices < 2
 
 
 def position_quantity(

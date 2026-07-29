@@ -2,18 +2,39 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from datetime import datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from .api import TossClient
-from .broker import LiveBroker, PaperBroker
+from .api import TossApiError, TossClient
+from .broker import Execution, LiveBroker, OrderNotFilled, PaperBroker
 from .config import Settings
-from .state import PortfolioState, Position
-from .strategy import MomentumSignal, analyze_candidate, exit_reason, position_quantity
+from .state import PendingOrder, PortfolioState, Position
+from .strategy import (
+    MomentumSignal,
+    analyze_candidate,
+    exit_reason,
+    market_regime_allows,
+    position_quantity,
+)
 
 
 KST = timezone(timedelta(hours=9))
+
+ACCOUNT_HALT_CODES = {
+    "account-not-found",
+    "account-restricted",
+    "investor-exchange-not-integrated",
+    "prerequisite-required",
+}
+SYMBOL_BLOCK_CODES = {
+    "stock-restricted",
+    "market-not-supported-for-stock",
+    "order-type-not-allowed",
+    "opposite-pending-order-exists",
+    "price-out-of-range",
+}
 
 
 def configure_logging(project_root: Path) -> logging.Logger:
@@ -29,9 +50,7 @@ def configure_logging(project_root: Path) -> logging.Logger:
     logger.addHandler(console)
     log_dir = project_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(
-        log_dir / "trader.log", encoding="utf-8"
-    )
+    file_handler = logging.FileHandler(log_dir / "trader.log", encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     return logger
@@ -42,13 +61,17 @@ def _parse_clock(value: str) -> clock_time:
     return clock_time(int(hour), int(minute), tzinfo=KST)
 
 
+def _safe_decimal(value: object | None) -> Decimal:
+    return Decimal(str(value or "0"))
+
+
 class TradingEngine:
     def __init__(self, settings: Settings, client: TossClient) -> None:
         self.settings = settings
         self.client = client
         self.logger = configure_logging(settings.project_root)
         today = datetime.now(KST).date().isoformat()
-        if settings.mode == "live" and not settings.state_path.exists():
+        if settings.mode == "live":
             starting_cash = Decimal(str(client.buying_power()["cashBuyingPower"]))
         else:
             starting_cash = settings.paper_starting_cash_krw
@@ -56,7 +79,9 @@ class TradingEngine:
             settings.state_path, today, starting_cash
         )
         self.broker = (
-            LiveBroker(client) if settings.mode == "live" else PaperBroker()
+            LiveBroker(client, settings.order_timeout_seconds)
+            if settings.mode == "live"
+            else PaperBroker()
         )
 
     def _entry_window_open(self, now: datetime) -> bool:
@@ -95,9 +120,7 @@ class TradingEngine:
             for item in self.client.prices(symbols)
         }
 
-    def _equity(
-        self, cash: Decimal, prices: dict[str, Decimal]
-    ) -> Decimal:
+    def _equity(self, cash: Decimal, prices: dict[str, Decimal]) -> Decimal:
         position_value = sum(
             (
                 prices.get(symbol, position.entry_price) * position.quantity
@@ -107,30 +130,220 @@ class TradingEngine:
         )
         return cash + position_value
 
+    def _new_pending(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: int,
+        reference_price: Decimal,
+        now: datetime,
+        reason: str | None = None,
+    ) -> PendingOrder:
+        pending = PendingOrder(
+            client_order_id=f"tat-{now:%y%m%d}-{side.lower()}-{uuid.uuid4().hex[:10]}",
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            created_at=now.isoformat(),
+            reference_price=reference_price,
+            reason=reason,
+        )
+        self.state.pending_order = pending
+        self.state.save(self.settings.state_path)
+        return pending
+
+    def _record_submitted(self, order_id: str) -> None:
+        if self.state.pending_order is None:
+            raise RuntimeError("Order callback received without a pending journal")
+        self.state.pending_order.order_id = order_id
+        self.state.save(self.settings.state_path)
+
+    def _apply_buy_execution(
+        self, pending: PendingOrder, execution: Execution, now: datetime
+    ) -> None:
+        self.state.positions[pending.symbol] = Position(
+            symbol=pending.symbol,
+            quantity=execution.quantity,
+            entry_price=execution.price,
+            high_water_price=execution.price,
+            opened_at=now.isoformat(),
+            entry_commission=execution.commission,
+            entry_tax=execution.tax,
+        )
+        if self.settings.mode == "paper":
+            self.state.cash -= (
+                execution.price * Decimal(execution.quantity)
+                + execution.commission
+                + execution.tax
+            )
+        self.state.daily_entries += 1
+        self.state.pending_order = None
+
+    def _apply_sell_execution(
+        self, pending: PendingOrder, execution: Execution
+    ) -> Decimal:
+        position = self.state.positions[pending.symbol]
+        sold_quantity = min(execution.quantity, position.quantity)
+        ratio = Decimal(sold_quantity) / Decimal(position.quantity)
+        allocated_entry_cost = (
+            position.entry_commission + position.entry_tax
+        ) * ratio
+        realized = (
+            (execution.price - position.entry_price) * Decimal(sold_quantity)
+            - allocated_entry_cost
+            - execution.commission
+            - execution.tax
+        )
+        self.state.realized_pnl += realized
+        if self.settings.mode == "paper":
+            self.state.cash += (
+                execution.price * Decimal(sold_quantity)
+                - execution.commission
+                - execution.tax
+            )
+        remaining = position.quantity - sold_quantity
+        if remaining == 0:
+            del self.state.positions[pending.symbol]
+        else:
+            position.quantity = remaining
+            position.entry_commission *= Decimal("1") - ratio
+            position.entry_tax *= Decimal("1") - ratio
+        self.state.pending_order = None
+        return realized
+
+    def _reconcile_pending(self, now: datetime) -> None:
+        pending = self.state.pending_order
+        if pending is None:
+            return
+        if self.settings.mode != "live":
+            self.state.entries_halted = True
+            self.state.halt_reason = "paper_pending_order_recovery_required"
+            self.state.save(self.settings.state_path)
+            return
+        if not pending.order_id:
+            self.state.entries_halted = True
+            self.state.halt_reason = "unresolved_order_without_server_id"
+            self.logger.error(
+                "ENTRY_HALT unresolved pending order clientOrderId=%s symbol=%s",
+                pending.client_order_id,
+                pending.symbol,
+            )
+            self.state.save(self.settings.state_path)
+            return
+
+        order = self.client.order(pending.order_id)
+        status = str(order.get("status", "UNKNOWN"))
+        if status not in LiveBroker.TERMINAL and not order.get("canceledAt"):
+            self.client.cancel_order(pending.order_id)
+            time.sleep(1)
+            order = self.client.order(pending.order_id)
+            status = str(order.get("status", "UNKNOWN"))
+        execution_data = order.get("execution", {})
+        filled = int(_safe_decimal(execution_data.get("filledQuantity")))
+        average = execution_data.get("averageFilledPrice")
+        if filled > 0 and average is not None:
+            execution = Execution(
+                pending.order_id,
+                filled,
+                Decimal(str(average)),
+                _safe_decimal(execution_data.get("commission")),
+                _safe_decimal(execution_data.get("tax")),
+            )
+            if pending.side == "BUY":
+                self._apply_buy_execution(pending, execution, now)
+            elif pending.symbol in self.state.positions:
+                realized = self._apply_sell_execution(pending, execution)
+                self.logger.info(
+                    "RECOVERED_EXIT symbol=%s qty=%s pnl=%s order=%s",
+                    pending.symbol,
+                    filled,
+                    realized,
+                    pending.order_id,
+                )
+        elif status in LiveBroker.TERMINAL or order.get("canceledAt"):
+            self.state.blocked_symbols[pending.symbol] = f"not_filled:{status}"
+            self.state.pending_order = None
+        else:
+            self.state.entries_halted = True
+            self.state.halt_reason = "pending_order_reconciliation_failed"
+        self.state.save(self.settings.state_path)
+
+    def _handle_order_error(
+        self, error: TossApiError, pending: PendingOrder
+    ) -> None:
+        reason = f"{error.code}:{error}"
+        if pending.order_id:
+            # An accepted order exists; leave the journal intact for the next
+            # reconciliation cycle rather than guessing its final state.
+            self.state.entries_halted = True
+            self.state.halt_reason = "accepted_order_status_unknown"
+        else:
+            self.state.pending_order = None
+            if error.code in ACCOUNT_HALT_CODES:
+                self.state.entries_halted = True
+                self.state.halt_reason = error.code
+            elif error.code in SYMBOL_BLOCK_CODES:
+                self.state.blocked_symbols[pending.symbol] = reason
+            else:
+                self.state.entries_halted = True
+                self.state.halt_reason = f"order_error:{error.code}"
+        self.state.last_error = reason
+        self.state.save(self.settings.state_path)
+        self.logger.error(
+            "ORDER_REJECTED side=%s symbol=%s code=%s status=%s requestId=%s",
+            pending.side,
+            pending.symbol,
+            error.code,
+            error.status,
+            error.request_id,
+        )
+
     def _sell(
         self, symbol: str, price: Decimal, reason: str, now: datetime
     ) -> None:
         position = self.state.positions[symbol]
-        execution = self.broker.sell(
-            symbol, position.quantity, reference_price=price
+        quantity = position.quantity
+        if self.settings.mode == "live":
+            quantity = min(quantity, int(self.client.sellable_quantity(symbol)))
+            if quantity <= 0:
+                self.state.entries_halted = True
+                self.state.halt_reason = "position_not_sellable"
+                self.state.last_error = f"{symbol} has no sellable quantity"
+                self.state.save(self.settings.state_path)
+                self.logger.error("EXIT_BLOCKED symbol=%s no sellable quantity", symbol)
+                return
+        pending = self._new_pending(
+            symbol=symbol,
+            side="SELL",
+            quantity=quantity,
+            reference_price=price,
+            now=now,
+            reason=reason,
         )
-        sold_quantity = min(execution.quantity, position.quantity)
-        realized = (
-            execution.price - position.entry_price
-        ) * Decimal(sold_quantity)
-        self.state.realized_pnl += realized
-        if self.settings.mode == "paper":
-            self.state.cash += execution.price * Decimal(sold_quantity)
-        remaining = position.quantity - sold_quantity
-        if remaining == 0:
-            del self.state.positions[symbol]
-        else:
-            position.quantity = remaining
+        try:
+            execution = self.broker.sell(
+                symbol,
+                quantity,
+                reference_price=price,
+                client_order_id=pending.client_order_id,
+                on_submitted=self._record_submitted,
+            )
+        except TossApiError as exc:
+            self._handle_order_error(exc, pending)
+            return
+        except OrderNotFilled as exc:
+            self.state.pending_order = None
+            self.state.last_error = str(exc)
+            self.state.save(self.settings.state_path)
+            self.logger.error("EXIT_NOT_FILLED symbol=%s status=%s", symbol, exc.status)
+            return
+        realized = self._apply_sell_execution(pending, execution)
         self.logger.info(
             "EXIT mode=%s symbol=%s qty=%s price=%s pnl=%s reason=%s order=%s",
             self.settings.mode,
             symbol,
-            sold_quantity,
+            execution.quantity,
             execution.price,
             realized,
             reason,
@@ -146,7 +359,7 @@ class TradingEngine:
             position = self.state.positions[symbol]
             current = prices.get(symbol)
             if current is None:
-                self.logger.warning("현재가 누락으로 청산 판단 보류: %s", symbol)
+                self.logger.warning("POSITION_PRICE_MISSING symbol=%s", symbol)
                 continue
             position.high_water_price = max(position.high_water_price, current)
             reason = exit_reason(position, current, self.settings)
@@ -172,33 +385,106 @@ class TradingEngine:
             self.state.halt_reason = "daily_profit_lock"
         if self.state.entries_halted:
             self.logger.warning(
-                "신규 진입 중지: reason=%s daily_pnl_rate=%.4f",
+                "ENTRY_HALT reason=%s daily_pnl_rate=%.4f",
                 self.state.halt_reason,
                 pnl_rate,
             )
         return pnl_rate
 
-    def scan(self) -> list[MomentumSignal]:
+    def _market_regime_ok(self, now: datetime) -> bool:
+        if not self.settings.market_regime_filter:
+            return True
+        candles = {
+            symbol: self.client.market_indicator_candles(symbol, count=20)
+            for symbol in ("KOSPI", "KOSDAQ")
+        }
+        allowed = market_regime_allows(candles, self.settings, now)
+        if not allowed:
+            self.logger.info("ENTRY_SKIP market_regime_filter")
+        return allowed
+
+    def _manual_holding_symbols(self) -> set[str]:
+        if self.settings.mode != "live":
+            return set()
+        result = self.client.holdings()
+        symbols: set[str] = set()
+
+        def collect(value: object) -> None:
+            if isinstance(value, dict):
+                symbol = value.get("symbol")
+                if symbol:
+                    symbols.add(str(symbol))
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        collect(result)
+        return symbols - set(self.state.positions)
+
+    def scan(
+        self,
+        now: datetime | None = None,
+        excluded_symbols: set[str] | None = None,
+    ) -> list[MomentumSignal]:
+        now = now or datetime.now(KST)
+        if not self._market_regime_ok(now):
+            return []
+        excluded = (excluded_symbols or set()) | set(self.state.blocked_symbols)
         signals: list[MomentumSignal] = []
         for ranking in self.client.rankings(self.settings.ranking_count):
             symbol = str(ranking["symbol"])
-            if symbol in self.state.positions:
+            if symbol in self.state.positions or symbol in excluded:
                 continue
-            # KR orders require whole shares. Avoid expensive candidates that
-            # can never fit inside the configured per-trade ceiling.
             if Decimal(str(ranking["price"]["lastPrice"])) > self.settings.max_trade_krw:
                 continue
-            warnings = self.client.stock_warnings(symbol)
-            if warnings:
+            if self.client.stock_warnings(symbol):
                 continue
             candles = self.client.candles(symbol, count=30)
             orderbook = self.client.orderbook(symbol)
             signal = analyze_candidate(
-                ranking, candles, orderbook, self.settings
+                ranking, candles, orderbook, self.settings, as_of=now
             )
             if signal is not None:
                 signals.append(signal)
         return sorted(signals, key=lambda item: item.score, reverse=True)
+
+    def _fresh_entry_quote(
+        self, signal: MomentumSignal, now: datetime
+    ) -> tuple[Decimal, int] | None:
+        prices = self.client.prices([signal.symbol])
+        if not prices:
+            return None
+        price_timestamp = datetime.fromisoformat(str(prices[0]["timestamp"]))
+        if abs((now - price_timestamp).total_seconds()) > self.settings.max_data_age_seconds:
+            self.logger.info("ENTRY_SKIP stale_price symbol=%s", signal.symbol)
+            return None
+        orderbook = self.client.orderbook(signal.symbol)
+        book_timestamp = datetime.fromisoformat(str(orderbook["timestamp"]))
+        if abs((now - book_timestamp).total_seconds()) > self.settings.max_data_age_seconds:
+            self.logger.info("ENTRY_SKIP stale_orderbook symbol=%s", signal.symbol)
+            return None
+        asks = sorted(
+            (
+                (Decimal(str(item["price"])), int(Decimal(str(item["volume"]))))
+                for item in orderbook.get("asks", [])
+            ),
+            key=lambda item: item[0],
+        )
+        if not asks:
+            return None
+        best_ask, best_ask_volume = asks[0]
+        baseline = signal.best_ask or signal.price
+        if best_ask > baseline * (Decimal("1") + self.settings.max_entry_slippage_rate):
+            self.logger.info(
+                "ENTRY_SKIP quote_moved symbol=%s baseline=%s ask=%s",
+                signal.symbol,
+                baseline,
+                best_ask,
+            )
+            return None
+        return best_ask, best_ask_volume
 
     def _buy(
         self,
@@ -207,32 +493,48 @@ class TradingEngine:
         equity: Decimal,
         now: datetime,
     ) -> bool:
+        quote = self._fresh_entry_quote(signal, now)
+        if quote is None:
+            return False
+        best_ask, best_ask_volume = quote
         quantity = position_quantity(
             cash=cash,
             equity=equity,
-            price=signal.price,
+            price=best_ask,
             settings=self.settings,
         )
+        quantity = min(quantity, best_ask_volume)
         if quantity <= 0:
-            self.logger.info("예산 부족으로 진입 생략: %s", signal.symbol)
+            self.logger.info("ENTRY_SKIP insufficient_budget symbol=%s", signal.symbol)
             return False
-        execution = self.broker.buy(
-            signal.symbol, quantity, reference_price=signal.price
-        )
-        cost = execution.price * Decimal(execution.quantity)
-        if self.settings.mode == "paper":
-            if cost > self.state.cash:
-                self.logger.warning("모의계좌 현금 부족으로 진입 취소: %s", signal.symbol)
-                return False
-            self.state.cash -= cost
-        self.state.positions[signal.symbol] = Position(
+        pending = self._new_pending(
             symbol=signal.symbol,
-            quantity=execution.quantity,
-            entry_price=execution.price,
-            high_water_price=execution.price,
-            opened_at=now.isoformat(),
+            side="BUY",
+            quantity=quantity,
+            reference_price=best_ask,
+            now=now,
         )
-        self.state.daily_entries += 1
+        try:
+            execution = self.broker.buy(
+                signal.symbol,
+                quantity,
+                reference_price=best_ask,
+                client_order_id=pending.client_order_id,
+                on_submitted=self._record_submitted,
+            )
+        except TossApiError as exc:
+            self._handle_order_error(exc, pending)
+            return False
+        except OrderNotFilled as exc:
+            self.state.pending_order = None
+            self.state.blocked_symbols[signal.symbol] = f"not_filled:{exc.status}"
+            self.state.last_error = str(exc)
+            self.state.save(self.settings.state_path)
+            self.logger.info(
+                "ENTRY_NOT_FILLED symbol=%s status=%s", signal.symbol, exc.status
+            )
+            return False
+        self._apply_buy_execution(pending, execution, now)
         self.logger.info(
             "ENTRY mode=%s symbol=%s qty=%s price=%s score=%.4f "
             "m5=%.4f m15=%.4f volume=%.2f spread=%.4f order=%s",
@@ -258,16 +560,19 @@ class TradingEngine:
             now.isoformat(timespec="seconds"),
             len(self.state.positions),
         )
+        self._reconcile_pending(now)
+        if self.state.pending_order is not None:
+            return
+
         prices = self._prices_for_positions()
         self._manage_positions(prices, now)
+        if self.state.pending_order is not None:
+            return
         prices = self._prices_for_positions()
         cash = self._cash()
         if self.settings.mode == "live":
             self.state.cash = cash
-        if (
-            self.state.trading_day != now.date().isoformat()
-            and not self.state.positions
-        ):
+        if self.state.trading_day != now.date().isoformat() and not self.state.positions:
             self.state.roll_to_new_day(now.date().isoformat(), cash)
         self._daily_guard(cash, prices)
 
@@ -295,19 +600,28 @@ class TradingEngine:
             return
         if self.state.daily_entries >= self.settings.max_daily_entries:
             self.logger.info(
-                "일일 진입 횟수 한도 도달: %s/%s",
+                "ENTRY_SKIP daily_limit=%s/%s",
                 self.state.daily_entries,
                 self.settings.max_daily_entries,
             )
             self.state.save(self.settings.state_path)
             return
 
+        if self.settings.mode == "live":
+            open_orders = self.client.list_orders("OPEN")
+            if open_orders:
+                self.logger.warning(
+                    "ENTRY_SKIP account_has_open_orders count=%s", len(open_orders)
+                )
+                self.state.save(self.settings.state_path)
+                return
+        excluded = self._manual_holding_symbols()
         slots = self.settings.max_open_positions - len(self.state.positions)
-        signals = self.scan()
+        signals = self.scan(now=now, excluded_symbols=excluded)
         equity = self._equity(cash, prices)
         opened = 0
         for signal in signals:
-            if opened >= slots:
+            if opened >= slots or self.state.entries_halted:
                 break
             if self._buy(signal, cash, equity, now):
                 opened += 1
@@ -316,7 +630,7 @@ class TradingEngine:
 
     def run_forever(self) -> None:
         self.logger.info(
-            "자동매매 시작: mode=%s interval=%ss",
+            "AUTO_TRADING_START mode=%s interval=%ss",
             self.settings.mode,
             self.settings.scan_interval_seconds,
         )
@@ -324,13 +638,33 @@ class TradingEngine:
             started = time.monotonic()
             try:
                 self.run_once()
-            except Exception:
-                self.logger.exception("사이클 실패; 다음 주기에 재시도합니다.")
+                self.state.consecutive_errors = 0
+            except Exception as exc:
+                self.state.consecutive_errors += 1
+                self.state.last_error = f"{type(exc).__name__}: {exc}"
+                self.logger.exception(
+                    "CYCLE_FAILED consecutive=%s/%s",
+                    self.state.consecutive_errors,
+                    self.settings.max_consecutive_errors,
+                )
+                if (
+                    self.state.consecutive_errors
+                    >= self.settings.max_consecutive_errors
+                ):
+                    self.state.entries_halted = True
+                    self.state.halt_reason = "unexpected_error_circuit_breaker"
+            self.state.save(self.settings.state_path)
             if self._process_stop_due(datetime.now(KST)):
                 self.logger.info(
-                    "프로세스 종료 시각 도달: %s",
+                    "AUTO_TRADING_STOP scheduled=%s",
                     self.settings.process_stop_time,
                 )
+                try:
+                    from .reporting import write_daily_report
+
+                    write_daily_report(self.settings, self.state, self.client)
+                except Exception:
+                    self.logger.exception("DAILY_REPORT_FAILED")
                 return
             elapsed = time.monotonic() - started
             time.sleep(max(1, self.settings.scan_interval_seconds - elapsed))

@@ -14,6 +14,8 @@ class Position:
     entry_price: Decimal
     high_water_price: Decimal
     opened_at: str
+    entry_commission: Decimal = Decimal("0")
+    entry_tax: Decimal = Decimal("0")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "Position":
@@ -23,6 +25,8 @@ class Position:
             entry_price=Decimal(str(value["entry_price"])),
             high_water_price=Decimal(str(value["high_water_price"])),
             opened_at=str(value["opened_at"]),
+            entry_commission=Decimal(str(value.get("entry_commission", "0"))),
+            entry_tax=Decimal(str(value.get("entry_tax", "0"))),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -32,6 +36,45 @@ class Position:
             "entry_price": str(self.entry_price),
             "high_water_price": str(self.high_water_price),
             "opened_at": self.opened_at,
+            "entry_commission": str(self.entry_commission),
+            "entry_tax": str(self.entry_tax),
+        }
+
+
+@dataclass
+class PendingOrder:
+    client_order_id: str
+    symbol: str
+    side: str
+    quantity: int
+    created_at: str
+    reference_price: Decimal
+    order_id: str | None = None
+    reason: str | None = None
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "PendingOrder":
+        return cls(
+            client_order_id=str(value["client_order_id"]),
+            symbol=str(value["symbol"]),
+            side=str(value["side"]),
+            quantity=int(value["quantity"]),
+            created_at=str(value["created_at"]),
+            reference_price=Decimal(str(value["reference_price"])),
+            order_id=value.get("order_id"),
+            reason=value.get("reason"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "client_order_id": self.client_order_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "quantity": self.quantity,
+            "created_at": self.created_at,
+            "reference_price": str(self.reference_price),
+            "order_id": self.order_id,
+            "reason": self.reason,
         }
 
 
@@ -45,6 +88,10 @@ class PortfolioState:
     daily_entries: int = 0
     entries_halted: bool = False
     halt_reason: str | None = None
+    blocked_symbols: dict[str, str] = field(default_factory=dict)
+    pending_order: PendingOrder | None = None
+    consecutive_errors: int = 0
+    last_error: str | None = None
 
     @classmethod
     def fresh(
@@ -75,9 +122,20 @@ class PortfolioState:
             daily_entries=int(raw.get("daily_entries", 0)),
             entries_halted=bool(raw.get("entries_halted", False)),
             halt_reason=raw.get("halt_reason"),
+            blocked_symbols={
+                str(symbol): str(reason)
+                for symbol, reason in raw.get("blocked_symbols", {}).items()
+            },
+            pending_order=(
+                PendingOrder.from_dict(raw["pending_order"])
+                if raw.get("pending_order")
+                else None
+            ),
+            consecutive_errors=int(raw.get("consecutive_errors", 0)),
+            last_error=raw.get("last_error"),
         )
         if state.trading_day != trading_day and not state.positions:
-            return cls.fresh(trading_day, state.cash)
+            return cls.fresh(trading_day, starting_cash)
         return state
 
     def save(self, path: Path) -> None:
@@ -90,6 +148,12 @@ class PortfolioState:
             "daily_entries": self.daily_entries,
             "entries_halted": self.entries_halted,
             "halt_reason": self.halt_reason,
+            "blocked_symbols": self.blocked_symbols,
+            "pending_order": (
+                self.pending_order.to_dict() if self.pending_order else None
+            ),
+            "consecutive_errors": self.consecutive_errors,
+            "last_error": self.last_error,
             "positions": {
                 symbol: position.to_dict()
                 for symbol, position in self.positions.items()
@@ -111,3 +175,7 @@ class PortfolioState:
         self.daily_entries = 0
         self.entries_halted = False
         self.halt_reason = None
+        self.blocked_symbols = {}
+        self.pending_order = None
+        self.consecutive_errors = 0
+        self.last_error = None

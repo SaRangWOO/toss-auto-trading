@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("check", "scan", "once", "run", "status")]
+    [ValidateSet("check", "scan", "once", "run", "status", "report")]
     [string]$Command = "status"
 )
 

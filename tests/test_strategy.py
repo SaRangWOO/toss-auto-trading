@@ -9,7 +9,12 @@ from pathlib import Path
 
 from toss_trader.config import Settings
 from toss_trader.state import Position
-from toss_trader.strategy import analyze_candidate, exit_reason, position_quantity
+from toss_trader.strategy import (
+    analyze_candidate,
+    exit_reason,
+    market_regime_allows,
+    position_quantity,
+)
 
 
 def settings(root: Path) -> Settings:
@@ -45,6 +50,13 @@ def settings(root: Path) -> Settings:
         min_volume_surge=Decimal("1.5"),
         max_spread_rate=Decimal("0.004"),
         max_price_over_vwap_rate=Decimal("0.05"),
+        order_timeout_seconds=12,
+        max_consecutive_errors=3,
+        max_data_age_seconds=180,
+        max_entry_slippage_rate=Decimal("0.003"),
+        market_regime_filter=False,
+        min_market_5m_rate=Decimal("-0.005"),
+        min_market_15m_rate=Decimal("-0.010"),
         project_root=root,
     )
 
@@ -167,6 +179,29 @@ class StrategyTests(unittest.TestCase):
             )
             self.assertEqual(
                 exit_reason(position, Decimal("10039"), config), "trailing_stop"
+            )
+
+    def test_market_regime_blocks_when_both_indices_sell_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            now = datetime(2026, 7, 29, 9, 50, tzinfo=timezone.utc)
+            candles = []
+            for index in range(20):
+                candles.append(
+                    {
+                        "timestamp": (
+                            datetime(2026, 7, 29, 9, 30, tzinfo=timezone.utc)
+                            .replace(minute=30 + index)
+                            .isoformat()
+                        ),
+                        "closePrice": str(1000 - index * 2),
+                        "volume": "1000",
+                    }
+                )
+            self.assertFalse(
+                market_regime_allows(
+                    {"KOSPI": candles, "KOSDAQ": candles}, config, now
+                )
             )
 
 

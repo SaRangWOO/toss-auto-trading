@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+from typing import BinaryIO
 
 from .api import TossApiError, TossClient
 from .config import Settings
 from .engine import TradingEngine
+from .reporting import write_daily_report
 
 
 def _client(settings: Settings) -> TossClient:
@@ -21,6 +24,52 @@ def _masked_account(account_no: str) -> str:
     if len(account_no) <= 4:
         return "*" * len(account_no)
     return "*" * (len(account_no) - 4) + account_no[-4:]
+
+
+class SingleInstanceLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.handle: BinaryIO | None = None
+
+    def __enter__(self) -> "SingleInstanceLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+b")
+        self.handle.seek(0, os.SEEK_END)
+        if self.handle.tell() == 0:
+            self.handle.write(b"0")
+            self.handle.flush()
+        self.handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.handle.close()
+            self.handle = None
+            raise RuntimeError(
+                "Another trading process is already running for this mode."
+            ) from exc
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        if self.handle is None:
+            return
+        self.handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        self.handle.close()
+        self.handle = None
 
 
 def command_check(settings: Settings) -> int:
@@ -72,6 +121,13 @@ def command_status(settings: Settings) -> int:
     return 0
 
 
+def command_report(settings: Settings) -> int:
+    engine = TradingEngine(settings, _client(settings))
+    path = write_daily_report(settings, engine.state, engine.client)
+    print(path)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="toss-trader",
@@ -79,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "command",
-        choices=("check", "scan", "once", "run", "status"),
+        choices=("check", "scan", "once", "run", "status", "report"),
         help=(
             "check=인증 점검, scan=후보 조회, once=1회 실행, "
             "run=반복 실행, status=로컬 상태"
@@ -104,12 +160,18 @@ def main() -> int:
             return command_scan(settings)
         if args.command == "status":
             return command_status(settings)
-        engine = TradingEngine(settings, _client(settings))
-        if args.command == "once":
-            engine.run_once()
+        if args.command == "report":
+            return command_report(settings)
+        lock_path = (
+            settings.project_root / "state" / f"{settings.mode}_trader.lock"
+        )
+        with SingleInstanceLock(lock_path):
+            engine = TradingEngine(settings, _client(settings))
+            if args.command == "once":
+                engine.run_once()
+                return 0
+            engine.run_forever()
             return 0
-        engine.run_forever()
-        return 0
     except KeyboardInterrupt:
         print("\n사용자 요청으로 종료했습니다.")
         return 130

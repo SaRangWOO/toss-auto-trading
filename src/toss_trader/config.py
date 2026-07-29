@@ -33,6 +33,15 @@ def _integer(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)))
 
 
+def _boolean(name: str, default: bool) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
 def _windows(value: str) -> tuple[tuple[str, str], ...]:
     windows: list[tuple[str, str]] = []
     for item in value.split(","):
@@ -76,6 +85,13 @@ class Settings:
     min_volume_surge: Decimal
     max_spread_rate: Decimal
     max_price_over_vwap_rate: Decimal
+    order_timeout_seconds: int
+    max_consecutive_errors: int
+    max_data_age_seconds: int
+    max_entry_slippage_rate: Decimal
+    market_regime_filter: bool
+    min_market_5m_rate: Decimal
+    min_market_15m_rate: Decimal
     project_root: Path
 
     @classmethod
@@ -123,6 +139,15 @@ class Settings:
             max_price_over_vwap_rate=_decimal(
                 "MAX_PRICE_OVER_VWAP_RATE", "0.050"
             ),
+            order_timeout_seconds=_integer("ORDER_TIMEOUT_SECONDS", 12),
+            max_consecutive_errors=_integer("MAX_CONSECUTIVE_ERRORS", 3),
+            max_data_age_seconds=_integer("MAX_DATA_AGE_SECONDS", 180),
+            max_entry_slippage_rate=_decimal(
+                "MAX_ENTRY_SLIPPAGE_RATE", "0.003"
+            ),
+            market_regime_filter=_boolean("MARKET_REGIME_FILTER", True),
+            min_market_5m_rate=_decimal("MIN_MARKET_5M_RATE", "-0.005"),
+            min_market_15m_rate=_decimal("MIN_MARKET_15M_RATE", "-0.010"),
             project_root=root,
         )
         settings.validate()
@@ -153,6 +178,14 @@ class Settings:
             raise ValueError("TAKE_PROFIT_RATE는 STOP_LOSS_RATE보다 커야 합니다.")
         if self.process_stop_time <= self.force_exit_time:
             raise ValueError("PROCESS_STOP_TIME은 FORCE_EXIT_TIME보다 늦어야 합니다.")
+        if not 5 <= self.order_timeout_seconds <= 60:
+            raise ValueError("ORDER_TIMEOUT_SECONDS must be between 5 and 60")
+        if not 1 <= self.max_consecutive_errors <= 10:
+            raise ValueError("MAX_CONSECUTIVE_ERRORS must be between 1 and 10")
+        if not 60 <= self.max_data_age_seconds <= 600:
+            raise ValueError("MAX_DATA_AGE_SECONDS must be between 60 and 600")
+        if not Decimal("0") < self.max_entry_slippage_rate <= Decimal("0.02"):
+            raise ValueError("MAX_ENTRY_SLIPPAGE_RATE must be in (0, 0.02]")
         if self.mode == "live":
             missing = []
             if not self.client_id:
