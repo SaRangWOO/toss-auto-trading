@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -86,6 +87,23 @@ class StrategyTests(unittest.TestCase):
                 settings=settings(Path(temporary)),
             )
             self.assertEqual(quantity, 5)
+
+    def test_position_size_can_use_authorized_two_hundred_thousand_won(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                settings(Path(temporary)),
+                max_trade_krw=Decimal("200000"),
+                max_position_rate=Decimal("0.98"),
+                risk_per_trade_rate=Decimal("0.01"),
+            )
+            config.validate()
+            quantity = position_quantity(
+                cash=Decimal("204644"),
+                equity=Decimal("204644"),
+                price=Decimal("10000"),
+                settings=config,
+            )
+            self.assertEqual(quantity, 20)
 
     def test_previous_day_candles_are_not_used_for_opening_momentum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
