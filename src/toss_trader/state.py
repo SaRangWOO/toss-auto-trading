@@ -49,6 +49,10 @@ class PortfolioState:
     sync_reason: str | None = None
     pending_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
     recovery_required: list[str] = field(default_factory=list)
+    pending_order: dict[str, Any] | None = None
+    blocked_symbols: dict[str, str] = field(default_factory=dict)
+    last_error: str | None = None
+    consecutive_errors: int = 0
 
     @classmethod
     def fresh(
@@ -83,6 +87,10 @@ class PortfolioState:
             sync_reason=raw.get("sync_reason"),
             pending_orders=dict(raw.get("pending_orders", {})),
             recovery_required=[str(item) for item in raw.get("recovery_required", [])],
+            pending_order=raw.get("pending_order"),
+            blocked_symbols=dict(raw.get("blocked_symbols", {})),
+            last_error=raw.get("last_error"),
+            consecutive_errors=int(raw.get("consecutive_errors", 0)),
         )
         if state.trading_day != trading_day and not state.positions:
             return cls.fresh(trading_day, state.cash)
@@ -102,6 +110,10 @@ class PortfolioState:
             "sync_reason": self.sync_reason,
             "pending_orders": self.pending_orders,
             "recovery_required": self.recovery_required,
+            "pending_order": self.pending_order,
+            "blocked_symbols": self.blocked_symbols,
+            "last_error": self.last_error,
+            "consecutive_errors": self.consecutive_errors,
             "positions": {
                 symbol: position.to_dict()
                 for symbol, position in self.positions.items()

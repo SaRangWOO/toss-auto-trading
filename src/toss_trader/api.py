@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import gzip
 import json
 import random
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 
@@ -20,11 +23,13 @@ class TossApiError(RuntimeError):
         code: str,
         message: str,
         request_id: str | None = None,
+        data: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(f"Toss OpenAPI {status} {code}: {message}")
         self.status = status
         self.code = code
         self.request_id = request_id
+        self.data = data or {}
 
 
 @dataclass
@@ -73,6 +78,18 @@ class TossClient:
             time.sleep(wait)
         self._last_call[group] = time.monotonic()
 
+    @staticmethod
+    def _decode_body(raw: bytes, content_encoding: str | None) -> str:
+        encoding = (content_encoding or "").lower()
+        try:
+            if raw.startswith(b"\x1f\x8b") or "gzip" in encoding:
+                raw = gzip.decompress(raw)
+            elif "deflate" in encoding:
+                raw = zlib.decompress(raw)
+        except (EOFError, OSError, zlib.error):
+            pass
+        return raw.decode("utf-8", errors="replace")
+
     def issue_token(self, force: bool = False) -> str:
         if (
             not force
@@ -120,11 +137,15 @@ class TossClient:
             with urllib.request.urlopen(
                 request, timeout=self.timeout_seconds
             ) as response:
-                raw = response.read().decode("utf-8")
+                raw = self._decode_body(
+                    response.read(), response.headers.get("Content-Encoding")
+                )
                 headers = {key.lower(): value for key, value in response.headers.items()}
                 return json.loads(raw), headers
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
+            raw = self._decode_body(
+                exc.read(), exc.headers.get("Content-Encoding")
+            )
             try:
                 error_payload = json.loads(raw).get("error", {})
             except json.JSONDecodeError:
@@ -132,6 +153,7 @@ class TossClient:
             code = str(error_payload.get("code", "http-error"))
             message = str(error_payload.get("message", raw[:300] or exc.reason))
             request_id = error_payload.get("requestId") or exc.headers.get("X-Request-Id")
+            error_data = error_payload.get("data")
             if exc.code == 401 and authenticated and retry == 0:
                 self.issue_token(force=True)
                 return self._open(
@@ -154,7 +176,13 @@ class TossClient:
                     group=group,
                     retry=retry + 1,
                 )
-            raise TossApiError(exc.code, code, message, request_id) from exc
+            raise TossApiError(
+                exc.code,
+                code,
+                message,
+                request_id,
+                error_data if isinstance(error_data, dict) else None,
+            ) from exc
         except urllib.error.URLError as exc:
             if retry < 2:
                 time.sleep(2**retry)
@@ -185,7 +213,10 @@ class TossClient:
             }
             url += "?" + urllib.parse.urlencode(clean_query)
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+        }
         if body is not None:
             headers["Content-Type"] = "application/json"
         if account:
@@ -270,6 +301,11 @@ class TossClient:
             account=True,
         )
 
+    def price_limits(self, symbol: str) -> dict[str, Any]:
+        return self._request(
+            "GET", "/api/v1/price-limits", "MARKET_DATA", query={"symbol": symbol}
+        )
+
     def pending_orders(self) -> list[dict[str, Any]]:
         result = self._request(
             "GET",
@@ -282,6 +318,35 @@ class TossClient:
             return result
         return result.get("orders", result.get("pendingOrders", []))
 
+    def create_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: int,
+        client_order_id: str,
+        order_type: str = "MARKET",
+        price: Decimal | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "clientOrderId": client_order_id,
+            "symbol": symbol,
+            "side": side,
+            "orderType": order_type,
+            "quantity": str(quantity),
+        }
+        if order_type == "LIMIT":
+            if price is None or price <= 0:
+                raise ValueError("LIMIT 주문에는 양수 price가 필요합니다.")
+            body["price"] = format(price, "f")
+        return self._request(
+            "POST",
+            "/api/v1/orders",
+            "ORDER",
+            body=body,
+            account=True,
+        )
+
     def create_market_order(
         self,
         *,
@@ -290,19 +355,11 @@ class TossClient:
         quantity: int,
         client_order_id: str,
     ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            "/api/v1/orders",
-            "ORDER",
-            body={
-                "clientOrderId": client_order_id,
-                "symbol": symbol,
-                "side": side,
-                "orderType": "MARKET",
-                "quantity": str(quantity),
-                "confirmHighValueOrder": False,
-            },
-            account=True,
+        return self.create_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            client_order_id=client_order_id,
         )
 
     def order(self, order_id: str) -> dict[str, Any]:

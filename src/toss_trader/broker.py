@@ -4,6 +4,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Callable
 
 from .api import TossClient
 
@@ -22,16 +23,32 @@ class PaperBroker:
         self.slippage = slippage_bps / Decimal("10000")
 
     def buy(
-        self, symbol: str, quantity: int, reference_price: Decimal
+        self,
+        symbol: str,
+        quantity: int,
+        reference_price: Decimal,
+        *,
+        on_submitted: Callable[[str], None] | None = None,
     ) -> Execution:
         price = reference_price * (Decimal("1") + self.slippage)
-        return Execution(f"paper-{uuid.uuid4().hex[:12]}", quantity, price)
+        order_id = f"paper-{uuid.uuid4().hex[:12]}"
+        if on_submitted is not None:
+            on_submitted(order_id)
+        return Execution(order_id, quantity, price)
 
     def sell(
-        self, symbol: str, quantity: int, reference_price: Decimal
+        self,
+        symbol: str,
+        quantity: int,
+        reference_price: Decimal,
+        *,
+        on_submitted: Callable[[str], None] | None = None,
     ) -> Execution:
         price = reference_price * (Decimal("1") - self.slippage)
-        return Execution(f"paper-{uuid.uuid4().hex[:12]}", quantity, price)
+        order_id = f"paper-{uuid.uuid4().hex[:12]}"
+        if on_submitted is not None:
+            on_submitted(order_id)
+        return Execution(order_id, quantity, price)
 
 
 class LiveBroker:
@@ -48,15 +65,27 @@ class LiveBroker:
     def __init__(self, client: TossClient) -> None:
         self.client = client
 
-    def _execute(self, symbol: str, side: str, quantity: int) -> Execution:
+    def _execute(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        *,
+        limit_price: Decimal | None = None,
+        on_submitted: Callable[[str], None] | None = None,
+    ) -> Execution:
         client_order_id = f"tat-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-        created = self.client.create_market_order(
+        created = self.client.create_order(
             symbol=symbol,
             side=side,
             quantity=quantity,
             client_order_id=client_order_id,
+            order_type="LIMIT" if limit_price is not None else "MARKET",
+            price=limit_price,
         )
         order_id = str(created["orderId"])
+        if on_submitted is not None:
+            on_submitted(order_id)
         deadline = time.monotonic() + 15
         order: dict = {}
         while time.monotonic() < deadline:
@@ -79,12 +108,33 @@ class LiveBroker:
         return Execution(order_id, filled_quantity, Decimal(str(average_price)))
 
     def buy(
-        self, symbol: str, quantity: int, reference_price: Decimal
+        self,
+        symbol: str,
+        quantity: int,
+        reference_price: Decimal,
+        *,
+        on_submitted: Callable[[str], None] | None = None,
     ) -> Execution:
-        return self._execute(symbol, "BUY", quantity)
+        return self._execute(
+            symbol,
+            "BUY",
+            quantity,
+            limit_price=reference_price,
+            on_submitted=on_submitted,
+        )
 
     def sell(
-        self, symbol: str, quantity: int, reference_price: Decimal
+        self,
+        symbol: str,
+        quantity: int,
+        reference_price: Decimal,
+        *,
+        on_submitted: Callable[[str], None] | None = None,
     ) -> Execution:
-        return self._execute(symbol, "SELL", quantity)
+        return self._execute(
+            symbol,
+            "SELL",
+            quantity,
+            on_submitted=on_submitted,
+        )
 
