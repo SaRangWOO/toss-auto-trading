@@ -12,7 +12,7 @@ Toss OpenAPI (REST polling)
        paper: 5bp 불리한 즉시 체결
        live: 매수 limit, 매도 market, 조회·timeout·취소·부분 체결
   -> 포지션: stop·take profit·trailing·15:10 청산·pending 복구
-  -> state/*.json + logs/trader.log + report/YYYY-MM-DD.md
+  -> state/*.json + logs/trader.log + report/YYYY/MM/YYYY-MM-DD.md
 ```
 
 CLI가 설정을 읽고 `once` 또는 `run_forever()`를 실행한다. 주문 전 pending

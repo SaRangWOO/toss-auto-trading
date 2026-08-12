@@ -68,13 +68,26 @@ class Settings:
     max_open_positions: int
     max_daily_entries: int
     max_daily_loss_rate: Decimal
+    max_daily_loss_krw: Decimal
     max_daily_profit_lock_rate: Decimal
     risk_per_trade_rate: Decimal
     max_position_rate: Decimal
     stop_loss_rate: Decimal
     take_profit_rate: Decimal
     trailing_stop_rate: Decimal
+    min_hold_seconds: int
+    min_volatility_rate: Decimal
+    max_stop_loss_rate: Decimal
+    atr_stop_multiplier: Decimal
+    atr_take_profit_multiplier: Decimal
+    atr_trailing_multiplier: Decimal
     ranking_count: int
+    candle_lookback_count: int
+    adaptive_shadow_enabled: bool
+    adaptive_shadow_max_candidates: int
+    adaptive_shadow_min_score: Decimal
+    breakout_confirmation_candles: int
+    failure_exit_enabled: bool
     min_trading_amount_krw: Decimal
     min_daily_change_rate: Decimal
     max_daily_change_rate: Decimal
@@ -85,6 +98,9 @@ class Settings:
     min_volume_surge: Decimal
     max_spread_rate: Decimal
     max_price_over_vwap_rate: Decimal
+    institutional_proxy_filter: bool
+    min_orderbook_imbalance_rate: Decimal
+    min_institutional_proxy_score: int
     order_timeout_seconds: int
     max_consecutive_errors: int
     max_data_age_seconds: int
@@ -107,15 +123,16 @@ class Settings:
             live_confirmation=os.getenv("LIVE_TRADING_CONFIRM", "").strip(),
             scan_interval_seconds=_integer("SCAN_INTERVAL_SECONDS", 30),
             entry_windows=_windows(
-                os.getenv("ENTRY_WINDOWS", "09:05-10:30,13:30-14:45")
+                os.getenv("ENTRY_WINDOWS", "10:00-11:30,14:50-15:30")
             ),
-            force_exit_time=os.getenv("FORCE_EXIT_TIME", "15:10").strip(),
-            process_stop_time=os.getenv("PROCESS_STOP_TIME", "15:20").strip(),
+            force_exit_time=os.getenv("FORCE_EXIT_TIME", "15:35").strip(),
+            process_stop_time=os.getenv("PROCESS_STOP_TIME", "15:40").strip(),
             paper_starting_cash_krw=_decimal("PAPER_STARTING_CASH_KRW", "1000000"),
             max_trade_krw=_decimal("MAX_TRADE_KRW", "100000"),
             max_open_positions=_integer("MAX_OPEN_POSITIONS", 2),
-            max_daily_entries=_integer("MAX_DAILY_ENTRIES", 3),
+            max_daily_entries=_integer("MAX_DAILY_ENTRIES", 2),
             max_daily_loss_rate=_decimal("MAX_DAILY_LOSS_RATE", "0.010"),
+            max_daily_loss_krw=_decimal("MAX_DAILY_LOSS_KRW", "0"),
             max_daily_profit_lock_rate=_decimal(
                 "MAX_DAILY_PROFIT_LOCK_RATE", "0.020"
             ),
@@ -124,9 +141,29 @@ class Settings:
             stop_loss_rate=_decimal("STOP_LOSS_RATE", "0.008"),
             take_profit_rate=_decimal("TAKE_PROFIT_RATE", "0.015"),
             trailing_stop_rate=_decimal("TRAILING_STOP_RATE", "0.006"),
+            min_hold_seconds=_integer("MIN_HOLD_SECONDS", 180),
+            min_volatility_rate=_decimal("MIN_VOLATILITY_RATE", "0.004"),
+            max_stop_loss_rate=_decimal("MAX_STOP_LOSS_RATE", "0.020"),
+            atr_stop_multiplier=_decimal("ATR_STOP_MULTIPLIER", "1.5"),
+            atr_take_profit_multiplier=_decimal(
+                "ATR_TAKE_PROFIT_MULTIPLIER", "2.5"
+            ),
+            atr_trailing_multiplier=_decimal("ATR_TRAILING_MULTIPLIER", "1.25"),
             ranking_count=_integer("RANKING_COUNT", 30),
+            candle_lookback_count=_integer("CANDLE_LOOKBACK_COUNT", 200),
+            adaptive_shadow_enabled=_boolean("ADAPTIVE_SHADOW_ENABLED", True),
+            adaptive_shadow_max_candidates=_integer(
+                "ADAPTIVE_SHADOW_MAX_CANDIDATES", 10
+            ),
+            adaptive_shadow_min_score=_decimal(
+                "ADAPTIVE_SHADOW_MIN_SCORE", "0.65"
+            ),
+            breakout_confirmation_candles=_integer(
+                "BREAKOUT_CONFIRMATION_CANDLES", 2
+            ),
+            failure_exit_enabled=_boolean("FAILURE_EXIT_ENABLED", True),
             min_trading_amount_krw=_decimal(
-                "MIN_TRADING_AMOUNT_KRW", "10000000000"
+                "MIN_TRADING_AMOUNT_KRW", "50000000000"
             ),
             min_daily_change_rate=_decimal("MIN_DAILY_CHANGE_RATE", "0.020"),
             max_daily_change_rate=_decimal("MAX_DAILY_CHANGE_RATE", "0.120"),
@@ -138,6 +175,13 @@ class Settings:
             max_spread_rate=_decimal("MAX_SPREAD_RATE", "0.004"),
             max_price_over_vwap_rate=_decimal(
                 "MAX_PRICE_OVER_VWAP_RATE", "0.050"
+            ),
+            institutional_proxy_filter=_boolean("INSTITUTIONAL_PROXY_FILTER", True),
+            min_orderbook_imbalance_rate=_decimal(
+                "MIN_ORDERBOOK_IMBALANCE_RATE", "0.10"
+            ),
+            min_institutional_proxy_score=_integer(
+                "MIN_INSTITUTIONAL_PROXY_SCORE", 3
             ),
             order_timeout_seconds=_integer("ORDER_TIMEOUT_SECONDS", 12),
             max_consecutive_errors=_integer("MAX_CONSECUTIVE_ERRORS", 3),
@@ -166,6 +210,14 @@ class Settings:
             raise ValueError("MAX_OPEN_POSITIONS는 1~5 범위여야 합니다.")
         if not 1 <= self.max_daily_entries <= 20:
             raise ValueError("MAX_DAILY_ENTRIES는 1~20 범위여야 합니다.")
+        if not 16 <= self.candle_lookback_count <= 200:
+            raise ValueError("CANDLE_LOOKBACK_COUNT must be between 16 and 200")
+        if not 1 <= self.adaptive_shadow_max_candidates <= 30:
+            raise ValueError("ADAPTIVE_SHADOW_MAX_CANDIDATES must be between 1 and 30")
+        if not Decimal("0") <= self.adaptive_shadow_min_score <= Decimal("1"):
+            raise ValueError("ADAPTIVE_SHADOW_MIN_SCORE must be in [0, 1]")
+        if not 1 <= self.breakout_confirmation_candles <= 3:
+            raise ValueError("BREAKOUT_CONFIRMATION_CANDLES must be between 1 and 3")
         for name, value, upper in (
             ("MAX_DAILY_LOSS_RATE", self.max_daily_loss_rate, Decimal("0.03")),
             ("RISK_PER_TRADE_RATE", self.risk_per_trade_rate, Decimal("0.01")),
@@ -178,6 +230,20 @@ class Settings:
             raise ValueError("TAKE_PROFIT_RATE는 STOP_LOSS_RATE보다 커야 합니다.")
         if self.process_stop_time <= self.force_exit_time:
             raise ValueError("PROCESS_STOP_TIME은 FORCE_EXIT_TIME보다 늦어야 합니다.")
+        if self.min_hold_seconds < 0:
+            raise ValueError("MIN_HOLD_SECONDS must be non-negative")
+        if self.min_volatility_rate <= 0:
+            raise ValueError("MIN_VOLATILITY_RATE must be positive")
+        if self.max_stop_loss_rate < self.stop_loss_rate:
+            raise ValueError("MAX_STOP_LOSS_RATE must not be below STOP_LOSS_RATE")
+        if min(
+            self.atr_stop_multiplier,
+            self.atr_take_profit_multiplier,
+            self.atr_trailing_multiplier,
+        ) <= 0:
+            raise ValueError("ATR multipliers must be positive")
+        if self.max_daily_loss_krw < 0:
+            raise ValueError("MAX_DAILY_LOSS_KRW must be non-negative")
         if not 5 <= self.order_timeout_seconds <= 60:
             raise ValueError("ORDER_TIMEOUT_SECONDS must be between 5 and 60")
         if not 1 <= self.max_consecutive_errors <= 10:
@@ -186,6 +252,10 @@ class Settings:
             raise ValueError("MAX_DATA_AGE_SECONDS must be between 60 and 600")
         if not Decimal("0") < self.max_entry_slippage_rate <= Decimal("0.02"):
             raise ValueError("MAX_ENTRY_SLIPPAGE_RATE must be in (0, 0.02]")
+        if not Decimal("0") <= self.min_orderbook_imbalance_rate < Decimal("1"):
+            raise ValueError("MIN_ORDERBOOK_IMBALANCE_RATE must be in [0, 1)")
+        if not 0 <= self.min_institutional_proxy_score <= 4:
+            raise ValueError("MIN_INSTITUTIONAL_PROXY_SCORE must be between 0 and 4")
         if self.mode == "live":
             missing = []
             if not self.client_id:

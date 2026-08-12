@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from toss_trader.config import LIVE_CONFIRMATION
-from toss_trader.engine import KST, TradingEngine
+from toss_trader.engine import KST, TradingEngine, _is_leveraged_or_inverse_etp
 from toss_trader.state import PendingOrder, Position
 from toss_trader.strategy import MomentumSignal
 
@@ -17,6 +17,16 @@ from test_strategy import settings
 
 
 class FakeClient:
+    def stocks(self, symbols: list[str]) -> list[dict]:
+        return [
+            {
+                "symbol": symbol,
+                "securityType": "STOCK",
+                "leverageFactor": None,
+            }
+            for symbol in symbols
+        ]
+
     def prices(self, symbols: list[str]) -> list[dict]:
         return []
 
@@ -66,10 +76,28 @@ def signal(symbol: str, price: str, score: str) -> MomentumSignal:
         volume_surge=Decimal("2"),
         vwap=value * Decimal("0.99"),
         spread_rate=Decimal("0.001"),
+        institutional_proxy_score=3,
     )
 
 
 class EngineTests(unittest.TestCase):
+    def test_leveraged_and_inverse_etps_are_restricted(self) -> None:
+        self.assertTrue(
+            _is_leveraged_or_inverse_etp(
+                {"securityType": "ETF", "leverageFactor": "2"}
+            )
+        )
+        self.assertTrue(
+            _is_leveraged_or_inverse_etp(
+                {"securityType": "ETN", "leverageFactor": "-1"}
+            )
+        )
+        self.assertFalse(
+            _is_leveraged_or_inverse_etp(
+                {"securityType": "ETF", "leverageFactor": "1"}
+            )
+        )
+
     def close_engine(self, engine: TradingEngine) -> None:
         for handler in list(engine.logger.handlers):
             handler.close()

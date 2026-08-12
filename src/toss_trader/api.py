@@ -286,6 +286,24 @@ class TossClient:
             "GET", f"/api/v1/stocks/{symbol}/warnings", "STOCK"
         )
 
+    def trades(self, symbol: str, count: int = 50) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET",
+            "/api/v1/trades",
+            "MARKET_DATA",
+            query={"symbol": symbol, "count": count},
+        )
+        return result if isinstance(result, list) else result.get("trades", [])
+
+    def stocks(self, symbols: list[str]) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET",
+            "/api/v1/stocks",
+            "STOCK",
+            query={"symbols": ",".join(symbols)},
+        )
+        return result if isinstance(result, list) else result.get("stocks", [])
+
     def kr_market_calendar(self) -> dict[str, Any]:
         return self._request(
             "GET", "/api/v1/market-calendar/KR", "MARKET_INFO"

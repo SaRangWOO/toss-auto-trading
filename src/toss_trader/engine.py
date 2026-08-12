@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -14,9 +15,12 @@ from .state import PendingOrder, PortfolioState, Position
 from .strategy import (
     MomentumSignal,
     analyze_candidate,
+    average_true_range_rate,
     exit_reason,
     market_regime_allows,
     position_quantity,
+    session_breakout_allowed,
+    adaptive_shadow_evaluate,
 )
 
 
@@ -63,6 +67,23 @@ def _parse_clock(value: str) -> clock_time:
 
 def _safe_decimal(value: object | None) -> Decimal:
     return Decimal(str(value or "0"))
+
+
+def _is_leveraged_or_inverse_etp(stock: dict) -> bool:
+    security_type = str(stock.get("securityType", "")).upper()
+    if security_type not in {"ETF", "FOREIGN_ETF", "ETN"}:
+        return False
+    factor = stock.get("leverageFactor")
+    if factor is not None and factor != "":
+        try:
+            return Decimal(str(factor)) != Decimal("1")
+        except Exception:
+            return True
+    name = f"{stock.get('name', '')} {stock.get('englishName', '')}".lower()
+    return any(
+        keyword in name
+        for keyword in ("레버리지", "인버스", "곱버스", "leveraged", "inverse")
+    )
 
 
 class TradingEngine:
@@ -160,7 +181,11 @@ class TradingEngine:
         self.state.save(self.settings.state_path)
 
     def _apply_buy_execution(
-        self, pending: PendingOrder, execution: Execution, now: datetime
+        self,
+        pending: PendingOrder,
+        execution: Execution,
+        now: datetime,
+        signal: MomentumSignal | None = None,
     ) -> None:
         self.state.positions[pending.symbol] = Position(
             symbol=pending.symbol,
@@ -168,6 +193,8 @@ class TradingEngine:
             entry_price=execution.price,
             high_water_price=execution.price,
             opened_at=now.isoformat(),
+            entry_vwap=signal.vwap if signal is not None else None,
+            breakout_reference=signal.price if signal is not None else None,
             entry_commission=execution.commission,
             entry_tax=execution.tax,
         )
@@ -362,7 +389,29 @@ class TradingEngine:
                 self.logger.warning("POSITION_PRICE_MISSING symbol=%s", symbol)
                 continue
             position.high_water_price = max(position.high_water_price, current)
-            reason = exit_reason(position, current, self.settings)
+            volatility_rate = None
+            candles = getattr(self.client, "candles", None)
+            if candles is not None:
+                try:
+                    volatility_rate = average_true_range_rate(
+                        candles(symbol, count=20), period=14
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "POSITION_VOLATILITY_UNAVAILABLE symbol=%s error=%s",
+                        symbol,
+                        type(exc).__name__,
+                    )
+            reason = exit_reason(
+                position,
+                current,
+                self.settings,
+                now=now,
+                volatility_rate=volatility_rate,
+                current_vwap=position.entry_vwap,
+                breakout_reference=position.breakout_reference,
+                failure_exit_enabled=self.settings.failure_exit_enabled,
+            )
             if overnight:
                 reason = "overnight_recovery"
             elif self._force_exit_due(now):
@@ -377,7 +426,10 @@ class TradingEngine:
         if self.state.initial_equity <= 0:
             return Decimal("0")
         pnl_rate = equity / self.state.initial_equity - Decimal("1")
-        if pnl_rate <= -self.settings.max_daily_loss_rate:
+        loss_limit_rate = self.settings.max_daily_loss_rate
+        if self.settings.max_daily_loss_krw > 0 and self.state.initial_equity > 0:
+            loss_limit_rate = self.settings.max_daily_loss_krw / self.state.initial_equity
+        if pnl_rate <= -loss_limit_rate:
             self.state.entries_halted = True
             self.state.halt_reason = "daily_loss_limit"
         elif pnl_rate >= self.settings.max_daily_profit_lock_rate:
@@ -433,22 +485,118 @@ class TradingEngine:
             return []
         excluded = (excluded_symbols or set()) | set(self.state.blocked_symbols)
         signals: list[MomentumSignal] = []
-        for ranking in self.client.rankings(self.settings.ranking_count):
+        rankings = self.client.rankings(self.settings.ranking_count)
+        stock_info = {
+            str(item["symbol"]): item
+            for item in self.client.stocks([str(item["symbol"]) for item in rankings])
+            if item.get("symbol")
+        }
+        shadow_count = 0
+        for ranking in rankings:
             symbol = str(ranking["symbol"])
             if symbol in self.state.positions or symbol in excluded:
+                continue
+            instrument = stock_info.get(symbol)
+            if instrument is None:
+                self.logger.info(
+                    "ENTRY_SKIP instrument_metadata_missing symbol=%s", symbol
+                )
+                continue
+            if _is_leveraged_or_inverse_etp(instrument):
+                self.logger.info(
+                    "ENTRY_SKIP leveraged_inverse_etp symbol=%s", symbol
+                )
                 continue
             if Decimal(str(ranking["price"]["lastPrice"])) > self.settings.max_trade_krw:
                 continue
             if self.client.stock_warnings(symbol):
                 continue
-            candles = self.client.candles(symbol, count=30)
-            orderbook = self.client.orderbook(symbol)
+            try:
+                candles = self.client.candles(
+                    symbol, count=self.settings.candle_lookback_count
+                )
+            except TossApiError as exc:
+                self.logger.warning(
+                    "ENTRY_SKIP candle_api_error symbol=%s code=%s status=%s",
+                    symbol,
+                    exc.code,
+                    exc.status,
+                )
+                continue
+            shadow_orderbook = None
+            if (
+                self.settings.adaptive_shadow_enabled
+                and shadow_count < self.settings.adaptive_shadow_max_candidates
+            ):
+                shadow_count += 1
+                try:
+                    shadow_orderbook = self.client.orderbook(symbol)
+                    shadow_trades = self.client.trades(symbol, count=50)
+                    evaluation = adaptive_shadow_evaluate(
+                        ranking,
+                        candles,
+                        shadow_orderbook,
+                        shadow_trades,
+                        self.settings,
+                        now,
+                        True,
+                    )
+                    self._record_adaptive_shadow(evaluation, now)
+                except Exception as exc:
+                    self.logger.warning(
+                        "ADAPTIVE_SHADOW_SKIP symbol=%s error=%s",
+                        symbol,
+                        type(exc).__name__,
+                    )
+            final_window = now.timetz().hour >= 14
+            if not session_breakout_allowed(
+                candles,
+                now,
+                final_window,
+                self.settings.breakout_confirmation_candles,
+            ):
+                self.logger.info(
+                    "ENTRY_SKIP session_breakout_filter symbol=%s final=%s",
+                    symbol,
+                    final_window,
+                )
+                continue
+            orderbook = shadow_orderbook or self.client.orderbook(symbol)
             signal = analyze_candidate(
                 ranking, candles, orderbook, self.settings, as_of=now
             )
             if signal is not None:
                 signals.append(signal)
         return sorted(signals, key=lambda item: item.score, reverse=True)
+
+    def _record_adaptive_shadow(self, evaluation, now: datetime) -> None:
+        """Persist shadow evidence without changing live eligibility or orders."""
+        try:
+            day = now.date().isoformat()
+            directory = self.settings.project_root / "reports" / "filter_funnel"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"{day}.jsonl"
+            record = {
+                "timestamp": now.isoformat(timespec="seconds"),
+                "symbol": evaluation.symbol,
+                "live_pass": evaluation.live_pass,
+                "shadow_pass": evaluation.shadow_pass,
+                "rejection_reasons": list(evaluation.rejection_reasons),
+                "scores": {
+                    "entry": str(evaluation.entry_score),
+                    "breakout": str(evaluation.breakout_score),
+                    "volume": str(evaluation.volume_score),
+                    "vwap": str(evaluation.vwap_score),
+                    "orderbook": str(evaluation.orderbook_score),
+                    "trade_pressure": str(evaluation.trade_pressure_score),
+                    "market_context": str(evaluation.market_context_score),
+                },
+                "metrics": evaluation.metrics,
+            }
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            self.logger.warning("ADAPTIVE_SHADOW_RECORD_FAILED error=%s", type(exc).__name__)
 
     def _fresh_entry_quote(
         self, signal: MomentumSignal, now: datetime
@@ -502,6 +650,7 @@ class TradingEngine:
             equity=equity,
             price=best_ask,
             settings=self.settings,
+            stop_rate=signal.risk_stop_rate,
         )
         quantity = min(quantity, best_ask_volume)
         if quantity <= 0:
@@ -534,10 +683,10 @@ class TradingEngine:
                 "ENTRY_NOT_FILLED symbol=%s status=%s", signal.symbol, exc.status
             )
             return False
-        self._apply_buy_execution(pending, execution, now)
+        self._apply_buy_execution(pending, execution, now, signal)
         self.logger.info(
             "ENTRY mode=%s symbol=%s qty=%s price=%s score=%.4f "
-            "m5=%.4f m15=%.4f volume=%.2f spread=%.4f order=%s",
+            "m5=%.4f m15=%.4f volume=%.2f spread=%.4f proxy=%s/4 order=%s",
             self.settings.mode,
             signal.symbol,
             execution.quantity,
@@ -547,6 +696,7 @@ class TradingEngine:
             signal.momentum_15m,
             signal.volume_surge,
             signal.spread_rate,
+            signal.institutional_proxy_score,
             execution.order_id,
         )
         self.state.save(self.settings.state_path)
@@ -654,6 +804,11 @@ class TradingEngine:
                     self.state.entries_halted = True
                     self.state.halt_reason = "unexpected_error_circuit_breaker"
             self.state.save(self.settings.state_path)
+            heartbeat = self.settings.project_root / "state" / f"{self.settings.mode}_heartbeat.json"
+            heartbeat.write_text(
+                json.dumps({"updated_at": datetime.now(KST).isoformat()}),
+                encoding="utf-8",
+            )
             if self._process_stop_due(datetime.now(KST)):
                 self.logger.info(
                     "AUTO_TRADING_STOP scheduled=%s",

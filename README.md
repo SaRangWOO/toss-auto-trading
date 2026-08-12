@@ -117,7 +117,7 @@ LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY
 
 - 상태: `state/paper_portfolio.json` 또는 `state/live_portfolio.json`
 - 로그: `logs/trader.log` (`mode=paper|live`가 각 거래 이벤트에 포함됨)
-- 날짜별 보고서: `report/YYYY-MM-DD.md`
+- 날짜별 보고서: `report/YYYY/MM/YYYY-MM-DD.md`
 - 실제 접수·미체결·체결·취소의 최종 근거: Toss WTS의 해당 계좌 주문 내역
 
 `status`는 로컬 상태만 읽습니다. live의 `report`는 계좌와 주문 API를

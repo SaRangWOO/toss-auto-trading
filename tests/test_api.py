@@ -90,6 +90,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(client.request["body"]["orderType"], "MARKET")
         self.assertNotIn("price", client.request["body"])
 
+    def test_stocks_uses_stock_info_endpoint(self) -> None:
+        client = RecordingClient()
+        client._request = lambda method, path, group, **kwargs: [
+            {"symbol": "069500", "securityType": "ETF", "leverageFactor": "1"}
+        ]
+        result = client.stocks(["069500"])
+        self.assertEqual(result[0]["symbol"], "069500")
+
+    def test_trades_uses_market_data_endpoint(self) -> None:
+        client = RecordingClient()
+        client._request = lambda method, path, group, **kwargs: {
+            "trades": [{"price": "10000", "volume": "10"}]
+        }
+        result = client.trades("005930", count=50)
+        self.assertEqual(result[0]["price"], "10000")
+
 
 if __name__ == "__main__":
     unittest.main()

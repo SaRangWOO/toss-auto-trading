@@ -5,6 +5,10 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $normalizedRoot = [IO.Path]::GetFullPath($projectRoot).TrimEnd('\')
 
 Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName TossAutoTrading-DailyReport -ErrorAction SilentlyContinue
+$pausePath = Join-Path $projectRoot "state\watchdog.pause"
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $pausePath) | Out-Null
+Set-Content -LiteralPath $pausePath -Value "paused" -Encoding ascii
 
 $targets = Get-CimInstance Win32_Process |
     Where-Object {

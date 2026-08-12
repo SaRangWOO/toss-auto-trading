@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -14,6 +17,8 @@ class Position:
     entry_price: Decimal
     high_water_price: Decimal
     opened_at: str
+    entry_vwap: Decimal | None = None
+    breakout_reference: Decimal | None = None
     entry_commission: Decimal = Decimal("0")
     entry_tax: Decimal = Decimal("0")
 
@@ -25,6 +30,8 @@ class Position:
             entry_price=Decimal(str(value["entry_price"])),
             high_water_price=Decimal(str(value["high_water_price"])),
             opened_at=str(value["opened_at"]),
+            entry_vwap=(Decimal(str(value["entry_vwap"])) if value.get("entry_vwap") is not None else None),
+            breakout_reference=(Decimal(str(value["breakout_reference"])) if value.get("breakout_reference") is not None else None),
             entry_commission=Decimal(str(value.get("entry_commission", "0"))),
             entry_tax=Decimal(str(value.get("entry_tax", "0"))),
         )
@@ -36,6 +43,8 @@ class Position:
             "entry_price": str(self.entry_price),
             "high_water_price": str(self.high_water_price),
             "opened_at": self.opened_at,
+            "entry_vwap": str(self.entry_vwap) if self.entry_vwap is not None else None,
+            "breakout_reference": str(self.breakout_reference) if self.breakout_reference is not None else None,
             "entry_commission": str(self.entry_commission),
             "entry_tax": str(self.entry_tax),
         }
@@ -107,9 +116,13 @@ class PortfolioState:
     def load_or_fresh(
         cls, path: Path, trading_day: str, starting_cash: Decimal
     ) -> "PortfolioState":
-        if not path.exists():
+        candidates = [path]
+        candidates.extend(path.parent.glob(f"{path.name}.recovery.*.json"))
+        candidates = [candidate for candidate in candidates if candidate.exists()]
+        if not candidates:
             return cls.fresh(trading_day, starting_cash)
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        source = max(candidates, key=lambda candidate: candidate.stat().st_mtime_ns)
+        raw = json.loads(source.read_text(encoding="utf-8"))
         state = cls(
             trading_day=str(raw["trading_day"]),
             initial_equity=Decimal(str(raw["initial_equity"])),
@@ -159,12 +172,32 @@ class PortfolioState:
                 for symbol, position in self.positions.items()
             },
         }
-        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary = path.with_name(
+            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        temporary.replace(path)
+        last_error: OSError | None = None
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                if attempt == 4:
+                    break
+                time.sleep(0.2 * (attempt + 1))
+        if last_error is not None:
+            recovery = path.with_name(
+                f"{path.name}.recovery.{os.getpid()}.{uuid.uuid4().hex}.json"
+            )
+            try:
+                os.replace(temporary, recovery)
+                return
+            except OSError:
+                raise last_error
 
     def roll_to_new_day(self, trading_day: str, starting_equity: Decimal) -> None:
         if self.positions:

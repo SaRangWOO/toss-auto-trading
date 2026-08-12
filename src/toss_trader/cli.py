@@ -8,7 +8,7 @@ from typing import BinaryIO
 
 from .api import TossApiError, TossClient
 from .config import Settings
-from .engine import TradingEngine
+from .engine import TradingEngine, configure_logging
 from .reporting import write_daily_report
 
 
@@ -177,6 +177,16 @@ def main() -> int:
         return 130
     except (ValueError, TossApiError, RuntimeError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        # Scheduled Task only exposes the exit code. Keep unexpected failures
+        # in the operational log before returning a non-zero code.
+        try:
+            logger = configure_logging(args.project_root)
+            logger.exception("CLI_FATAL error=%s", exc)
+        except Exception:
+            pass
+        print(f"Unexpected error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
 

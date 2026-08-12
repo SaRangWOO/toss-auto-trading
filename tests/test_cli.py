@@ -26,6 +26,34 @@ class CliTests(unittest.TestCase):
         self.assertIn("toss_trader.cli run", script)
         self.assertIn("$normalizedRoot", script)
 
+    def test_runner_persists_launcher_exit_diagnostics(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        script = (project_root / "scripts" / "run.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("launcher.log", script)
+        self.assertIn("POWERSHELL_FATAL", script)
+        self.assertIn("Out-File", script)
+        self.assertIn("-Encoding utf8", script)
+
+    def test_scheduled_task_restarts_and_has_report_fallback(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        script = (project_root / "scripts" / "install-task.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("-RestartCount 3", script)
+        self.assertIn("TossAutoTrading-DailyReport", script)
+        self.assertIn('"15:25"', script)
+
+    def test_watchdog_script_checks_heartbeat_and_restarts_runner(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        script = (project_root / "scripts" / "watchdog.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("live_heartbeat.json", script)
+        self.assertIn("Start-ScheduledTask", script)
+        self.assertIn("120", script)
+
 
 if __name__ == "__main__":
     unittest.main()
