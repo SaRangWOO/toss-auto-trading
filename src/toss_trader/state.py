@@ -22,6 +22,11 @@ class Position:
     failure_vwap_count: int = 0
     failure_breakout_count: int = 0
     last_failure_candle_at: str | None = None
+    review_5m_at: str | None = None
+    review_5m_outcome: str | None = None
+    review_10m_at: str | None = None
+    review_10m_outcome: str | None = None
+    strong_trend_confirmed: bool = False
     entry_commission: Decimal = Decimal("0")
     entry_tax: Decimal = Decimal("0")
 
@@ -38,6 +43,11 @@ class Position:
             failure_vwap_count=int(value.get("failure_vwap_count", 0)),
             failure_breakout_count=int(value.get("failure_breakout_count", 0)),
             last_failure_candle_at=value.get("last_failure_candle_at"),
+            review_5m_at=value.get("review_5m_at"),
+            review_5m_outcome=value.get("review_5m_outcome"),
+            review_10m_at=value.get("review_10m_at"),
+            review_10m_outcome=value.get("review_10m_outcome"),
+            strong_trend_confirmed=bool(value.get("strong_trend_confirmed", False)),
             entry_commission=Decimal(str(value.get("entry_commission", "0"))),
             entry_tax=Decimal(str(value.get("entry_tax", "0"))),
         )
@@ -54,6 +64,11 @@ class Position:
             "failure_vwap_count": self.failure_vwap_count,
             "failure_breakout_count": self.failure_breakout_count,
             "last_failure_candle_at": self.last_failure_candle_at,
+            "review_5m_at": self.review_5m_at,
+            "review_5m_outcome": self.review_5m_outcome,
+            "review_10m_at": self.review_10m_at,
+            "review_10m_outcome": self.review_10m_outcome,
+            "strong_trend_confirmed": self.strong_trend_confirmed,
             "entry_commission": str(self.entry_commission),
             "entry_tax": str(self.entry_tax),
         }

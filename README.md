@@ -83,8 +83,10 @@ LIVE_TRADING_CONFIRM=
 .\scripts\run.cmd run
 ```
 
-paper 주문은 5bp의 불리한 슬리피지를 적용해 즉시 체결로 모사합니다.
-실제 수수료·세금, 호가 충격과 지연을 완전히 재현하지 않습니다.
+paper 주문은 기본 5bp의 불리한 슬리피지와 설정 가능한 매수·매도 수수료,
+매도세 가정을 적용해 즉시 체결로 모사합니다. 기본 비용률은 실제 Toss 계좌의
+확정 요율이 아니라 전략을 보수적으로 평가하기 위한 모델값입니다. 부분 체결,
+호가 잔량에 따른 충격과 주문 지연은 아직 완전히 재현하지 않습니다.
 paper 체결은 상태 파일에도 주문 형태로 저장되어 날짜별 보고서의 왕복 거래와
 체결 기준 손익 계산에 사용됩니다.
 
@@ -95,6 +97,13 @@ paper 모드에는 2026-08-22 주간 검토에서 추가한 보수적인 오전 
 국면·스프레드·리스크·최종 신호 필터는 그대로 적용되고 live에서는 이 경로를
 평가하지 않습니다. 설정값은 `.env.example`의 `PAPER_CONTINUATION_*` 항목에서
 확인할 수 있습니다.
+
+paper 보유 포지션은 진입 후 5분과 10분에 VWAP, 최근 거래량 유지율과 체결
+압력 proxy를 다시 평가합니다. 약한 신호가 겹치거나 10분까지 추세 진전이
+없으면 조기 청산하고, 강한 추세가 확인되면 고정 익절 대신 최대 수익 대비
+되돌림 한도로 관리합니다. 이 경로와 비용 모델은 이번 paper 관찰을 위한
+실험이며 live 진입·청산 로직에는 적용되지 않습니다. 자세한 기준과 승격
+조건은 `docs/PAPER_POSITION_MANAGEMENT_2026-08-24.md`에 기록합니다.
 
 ## live 모드
 
@@ -129,6 +138,7 @@ LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY
 - 로그: `logs/trader.log` (`mode=paper|live`가 각 거래 이벤트에 포함됨)
 - 날짜별 보고서: `report/YYYY/MM/YYYY-MM-DD.md`
 - shadow 후보 사후성과: `reports/shadow_tracking/YYYY-MM-DD.json`
+- paper 5분·10분 보유 점검: `reports/position_reviews/YYYY-MM-DD.jsonl`
 - 실제 접수·미체결·체결·취소의 최종 근거: Toss WTS의 해당 계좌 주문 내역
 
 `status`는 로컬 상태만 읽습니다. live의 `report`는 계좌와 주문 API를

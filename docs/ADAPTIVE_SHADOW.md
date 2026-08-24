@@ -44,3 +44,21 @@ checks. It is never evaluated in live mode. Funnel records include a
 `continuation` diagnostic object so rejected cases can be distinguished by
 breakout age, opening-range hold/retest, VWAP distance, extension, confirmation
 count, and explicit rejection reasons.
+
+## Paper-only position management experiment
+
+Paper positions are reviewed once after five minutes and once after ten
+minutes. The review combines rolling VWAP, a recent-three-candle volume ratio,
+and the trade-pressure proxy. Two weak components can close a position at a
+checkpoint; at ten minutes a return below 0.3% plus one weak component is
+classified as no follow-through. Missing API data never causes a review exit.
+
+A position with at least 0.8% progress, price above VWAP, trade pressure of at
+least 0.55, and volume ratio of at least 0.80 is marked as a strong trend.
+Strong paper trends bypass fixed take-profit and the ordinary tight trailing
+exit, but remain subject to the hard stop, confirmed failure exits, forced
+close, and a maximum-MFE-giveback floor. The default giveback limit is 50% of
+the best unrealized gain after a 0.8% activation.
+
+The review state and outcome are persisted with the position and written to the
+operational log. This experiment is disabled by mode in live execution.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable
 
 from .api import TossClient
@@ -28,10 +28,21 @@ class OrderNotFilled(RuntimeError):
 
 
 class PaperBroker:
-    """Immediate-fill simulator with a small adverse slippage assumption."""
+    """Immediate-fill simulator with configurable adverse costs."""
 
-    def __init__(self, slippage_bps: Decimal = Decimal("5")) -> None:
+    def __init__(
+        self,
+        slippage_bps: Decimal = Decimal("5"),
+        commission_rate: Decimal = Decimal("0.00015"),
+        sell_tax_rate: Decimal = Decimal("0.0015"),
+    ) -> None:
         self.slippage = slippage_bps / Decimal("10000")
+        self.commission_rate = commission_rate
+        self.sell_tax_rate = sell_tax_rate
+
+    @staticmethod
+    def _won(value: Decimal) -> Decimal:
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     def buy(
         self,
@@ -46,7 +57,8 @@ class PaperBroker:
         order_id = f"paper-{uuid.uuid4().hex[:12]}"
         if on_submitted is not None:
             on_submitted(order_id)
-        return Execution(order_id, quantity, price)
+        commission = self._won(price * quantity * self.commission_rate)
+        return Execution(order_id, quantity, price, commission, Decimal("0"))
 
     def sell(
         self,
@@ -61,7 +73,10 @@ class PaperBroker:
         order_id = f"paper-{uuid.uuid4().hex[:12]}"
         if on_submitted is not None:
             on_submitted(order_id)
-        return Execution(order_id, quantity, price)
+        gross = price * quantity
+        commission = self._won(gross * self.commission_rate)
+        tax = self._won(gross * self.sell_tax_rate)
+        return Execution(order_id, quantity, price, commission, tax)
 
 
 class LiveBroker:

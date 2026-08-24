@@ -57,6 +57,15 @@ class ContinuationEvaluation:
     metrics: dict[str, str]
 
 
+@dataclass(frozen=True)
+class PositionReviewEvaluation:
+    checkpoint: str
+    data_complete: bool
+    exit_reason: str | None
+    strong_trend: bool
+    metrics: dict[str, str]
+
+
 def _return(current: Decimal, previous: Decimal) -> Decimal:
     if previous <= 0:
         return ZERO
@@ -339,6 +348,29 @@ def rolling_vwap(
         ),
         ZERO,
     ) / total_volume
+
+
+def recent_volume_ratio(
+    candles: list[dict[str, Any]],
+    as_of: datetime,
+    recent_count: int = 3,
+    baseline_count: int = 10,
+) -> Decimal | None:
+    """Compare recent completed-candle volume with its preceding baseline."""
+    completed = completed_intraday_candles(candles, as_of)
+    if len(completed) < recent_count + 1:
+        return None
+    recent = completed[-recent_count:]
+    baseline = completed[-recent_count - baseline_count : -recent_count]
+    baseline_volumes = [D(item.get("volume", "0")) for item in baseline]
+    baseline_volumes = [value for value in baseline_volumes if value > ZERO]
+    if not baseline_volumes:
+        return None
+    recent_average = sum(
+        (D(item.get("volume", "0")) for item in recent), ZERO
+    ) / D(len(recent))
+    baseline_median = D(statistics.median(baseline_volumes))
+    return recent_average / baseline_median if baseline_median > ZERO else None
 
 
 def estimated_trade_pressure(
@@ -707,6 +739,100 @@ def adaptive_shadow_evaluate(
     )
 
 
+def position_review_evaluate(
+    position: Position,
+    current_price: Decimal,
+    settings: Settings,
+    now: datetime,
+    *,
+    current_vwap: Decimal | None,
+    trade_pressure: Decimal | None,
+    volume_ratio: Decimal | None,
+) -> PositionReviewEvaluation | None:
+    """Evaluate one paper-only 5m/10m checkpoint without weakening hard exits."""
+    if settings.mode != "paper" or not settings.paper_position_review_enabled:
+        return None
+    opened_at = datetime.fromisoformat(position.opened_at)
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=timezone.utc)
+    elapsed_seconds = (now - opened_at).total_seconds()
+    if position.review_5m_at is None and elapsed_seconds >= settings.paper_review_5m_seconds:
+        checkpoint = "5m"
+    elif (
+        position.review_10m_at is None
+        and elapsed_seconds >= settings.paper_review_10m_seconds
+    ):
+        checkpoint = "10m"
+    else:
+        return None
+
+    gain = (
+        current_price / position.entry_price - Decimal("1")
+        if position.entry_price > ZERO
+        else -Decimal("1")
+    )
+    data_complete = (
+        current_vwap is not None
+        and current_vwap > ZERO
+        and trade_pressure is not None
+        and volume_ratio is not None
+    )
+    metrics = {
+        "elapsed_seconds": str(elapsed_seconds),
+        "gain_rate": str(gain),
+        "current_vwap": str(current_vwap) if current_vwap is not None else "",
+        "trade_pressure": (
+            str(trade_pressure) if trade_pressure is not None else ""
+        ),
+        "volume_ratio": str(volume_ratio) if volume_ratio is not None else "",
+    }
+    if not data_complete:
+        return PositionReviewEvaluation(
+            checkpoint,
+            False,
+            None,
+            False,
+            metrics,
+        )
+
+    assert current_vwap is not None
+    assert trade_pressure is not None
+    assert volume_ratio is not None
+    weak_count = sum(
+        (
+            current_price < current_vwap,
+            trade_pressure <= settings.paper_review_max_weak_trade_pressure,
+            volume_ratio < settings.paper_review_min_volume_ratio,
+        )
+    )
+    strong_trend = (
+        gain >= settings.paper_profit_activation_rate
+        and current_price > current_vwap
+        and trade_pressure >= settings.paper_review_min_strong_trade_pressure
+        and volume_ratio >= settings.paper_review_strong_volume_ratio
+    )
+    reason = None
+    if checkpoint == "5m" and weak_count >= 2:
+        reason = "paper_review_5m_weak"
+    elif checkpoint == "10m" and weak_count >= 2:
+        reason = "paper_review_10m_weak"
+    elif (
+        checkpoint == "10m"
+        and gain < settings.paper_review_min_10m_return
+        and weak_count >= 1
+    ):
+        reason = "paper_review_10m_no_followthrough"
+    metrics["weak_count"] = str(weak_count)
+    metrics["strong_trend"] = str(strong_trend).lower()
+    return PositionReviewEvaluation(
+        checkpoint,
+        True,
+        reason,
+        strong_trend,
+        metrics,
+    )
+
+
 def exit_reason(
     position: Position,
     current_price: Decimal,
@@ -764,8 +890,30 @@ def exit_reason(
             return "breakout_failure_vwap"
         if confirmed_breakout and selling_pressure:
             return "breakout_failure_retest"
-    if current_price >= take_profit:
+    paper_profit_protection = (
+        settings.mode == "paper" and settings.paper_profit_protection_enabled
+    )
+    mfe_rate = (
+        position.high_water_price / position.entry_price - Decimal("1")
+        if position.entry_price > ZERO
+        else ZERO
+    )
+    if (
+        paper_profit_protection
+        and mfe_rate >= settings.paper_profit_activation_rate
+    ):
+        retained_gain = mfe_rate * (
+            Decimal("1") - settings.paper_profit_max_giveback_fraction
+        )
+        profit_floor = position.entry_price * (Decimal("1") + retained_gain)
+        if current_price <= profit_floor:
+            return "paper_profit_giveback"
+    if current_price >= take_profit and not position.strong_trend_confirmed:
         return "take_profit"
-    if trailing_is_armed and current_price <= trailing_stop:
+    if (
+        trailing_is_armed
+        and not position.strong_trend_confirmed
+        and current_price <= trailing_stop
+    ):
         return "trailing_stop"
     return None

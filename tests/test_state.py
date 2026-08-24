@@ -77,6 +77,11 @@ class StateTests(unittest.TestCase):
                 failure_vwap_count=1,
                 failure_breakout_count=2,
                 last_failure_candle_at="2026-08-19T10:05:00+09:00",
+                review_5m_at="2026-08-19T10:05:00+09:00",
+                review_5m_outcome="strong_trend",
+                review_10m_at="2026-08-19T10:10:00+09:00",
+                review_10m_outcome="hold",
+                strong_trend_confirmed=True,
             )
             state.simulated_orders.append({"orderId": "paper-buy"})
             state.save(path)
@@ -86,6 +91,9 @@ class StateTests(unittest.TestCase):
             position = restored.positions["005930"]
             self.assertEqual(position.failure_vwap_count, 1)
             self.assertEqual(position.failure_breakout_count, 2)
+            self.assertEqual(position.review_5m_outcome, "strong_trend")
+            self.assertEqual(position.review_10m_outcome, "hold")
+            self.assertTrue(position.strong_trend_confirmed)
             self.assertEqual(len(restored.simulated_orders), 1)
 
 

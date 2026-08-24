@@ -19,6 +19,8 @@ from toss_trader.strategy import (
     exit_reason,
     market_regime_allows,
     position_quantity,
+    position_review_evaluate,
+    recent_volume_ratio,
     rolling_vwap,
     session_breakout_allowed,
 )
@@ -36,6 +38,9 @@ def settings(root: Path) -> Settings:
         force_exit_time="15:10",
         process_stop_time="15:20",
         paper_starting_cash_krw=Decimal("1000000"),
+        paper_slippage_bps=Decimal("5"),
+        paper_commission_rate=Decimal("0.00015"),
+        paper_sell_tax_rate=Decimal("0.0015"),
         max_trade_krw=Decimal("100000"),
         max_open_positions=2,
         max_daily_entries=3,
@@ -71,6 +76,17 @@ def settings(root: Path) -> Settings:
         failure_exit_enabled=True,
         failure_exit_confirmation_candles=2,
         failure_exit_max_trade_pressure=Decimal("0.45"),
+        paper_position_review_enabled=True,
+        paper_review_5m_seconds=300,
+        paper_review_10m_seconds=600,
+        paper_review_min_volume_ratio=Decimal("0.60"),
+        paper_review_strong_volume_ratio=Decimal("0.80"),
+        paper_review_max_weak_trade_pressure=Decimal("0.45"),
+        paper_review_min_strong_trade_pressure=Decimal("0.55"),
+        paper_review_min_10m_return=Decimal("0.003"),
+        paper_profit_protection_enabled=True,
+        paper_profit_activation_rate=Decimal("0.008"),
+        paper_profit_max_giveback_fraction=Decimal("0.50"),
         min_trading_amount_krw=Decimal("10000000000"),
         min_daily_change_rate=Decimal("0.02"),
         max_daily_change_rate=Decimal("0.12"),
@@ -365,7 +381,10 @@ class StrategyTests(unittest.TestCase):
 
     def test_trailing_stop_only_arms_after_gain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            config = settings(Path(temporary))
+            config = replace(
+                settings(Path(temporary)),
+                paper_profit_protection_enabled=False,
+            )
             position = Position(
                 symbol="005930",
                 quantity=10,
@@ -376,6 +395,166 @@ class StrategyTests(unittest.TestCase):
             self.assertEqual(
                 exit_reason(position, Decimal("10039"), config), "trailing_stop"
             )
+
+    def test_profit_giveback_protects_an_armed_paper_gain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10100"),
+                opened_at="2026-07-29T10:00:00+09:00",
+            )
+            self.assertEqual(
+                exit_reason(
+                    position,
+                    Decimal("10040"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T10:06:00+09:00"),
+                ),
+                "paper_profit_giveback",
+            )
+
+    def test_strong_paper_trend_bypasses_fixed_take_profit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10200"),
+                opened_at="2026-07-29T10:00:00+09:00",
+                strong_trend_confirmed=True,
+            )
+            self.assertIsNone(
+                exit_reason(
+                    position,
+                    Decimal("10150"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T10:10:00+09:00"),
+                )
+            )
+
+    def test_live_mode_ignores_paper_review_and_profit_protection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(settings(Path(temporary)), mode="live")
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10100"),
+                opened_at="2026-07-29T10:00:00+09:00",
+            )
+            self.assertIsNone(
+                position_review_evaluate(
+                    position,
+                    Decimal("10040"),
+                    config,
+                    datetime.fromisoformat("2026-07-29T10:06:00+09:00"),
+                    current_vwap=Decimal("10050"),
+                    trade_pressure=Decimal("0.40"),
+                    volume_ratio=Decimal("0.50"),
+                )
+            )
+            self.assertIsNone(
+                exit_reason(
+                    position,
+                    Decimal("10040"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T10:06:00+09:00"),
+                )
+            )
+
+    def test_five_minute_review_exits_when_two_signals_are_weak(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10020"),
+                opened_at="2026-07-29T10:00:00+09:00",
+            )
+            review = position_review_evaluate(
+                position,
+                Decimal("10020"),
+                config,
+                datetime.fromisoformat("2026-07-29T10:05:00+09:00"),
+                current_vwap=Decimal("10040"),
+                trade_pressure=Decimal("0.40"),
+                volume_ratio=Decimal("0.90"),
+            )
+            assert review is not None
+            self.assertTrue(review.data_complete)
+            self.assertEqual(review.exit_reason, "paper_review_5m_weak")
+
+    def test_five_minute_review_identifies_a_strong_trend(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10100"),
+                opened_at="2026-07-29T10:00:00+09:00",
+            )
+            review = position_review_evaluate(
+                position,
+                Decimal("10100"),
+                config,
+                datetime.fromisoformat("2026-07-29T10:05:00+09:00"),
+                current_vwap=Decimal("10040"),
+                trade_pressure=Decimal("0.70"),
+                volume_ratio=Decimal("1.10"),
+            )
+            assert review is not None
+            self.assertTrue(review.strong_trend)
+            self.assertIsNone(review.exit_reason)
+
+    def test_ten_minute_review_requires_followthrough(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10020"),
+                opened_at="2026-07-29T10:00:00+09:00",
+                review_5m_at="2026-07-29T10:05:00+09:00",
+                review_5m_outcome="hold",
+            )
+            review = position_review_evaluate(
+                position,
+                Decimal("10010"),
+                config,
+                datetime.fromisoformat("2026-07-29T10:10:00+09:00"),
+                current_vwap=Decimal("10000"),
+                trade_pressure=Decimal("0.40"),
+                volume_ratio=Decimal("0.90"),
+            )
+            assert review is not None
+            self.assertEqual(
+                review.exit_reason,
+                "paper_review_10m_no_followthrough",
+            )
+
+    def test_recent_volume_ratio_uses_completed_candles(self) -> None:
+        candles = [
+            {
+                "timestamp": f"2026-07-29T10:{minute:02d}:00+09:00",
+                "closePrice": "100",
+                "volume": "200" if minute >= 10 else "100",
+            }
+            for minute in range(13)
+        ]
+        self.assertEqual(
+            recent_volume_ratio(
+                candles,
+                datetime.fromisoformat("2026-07-29T10:13:30+09:00"),
+            ),
+            Decimal("2"),
+        )
 
     def test_minimum_hold_blocks_fast_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

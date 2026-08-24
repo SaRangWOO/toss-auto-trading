@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,9 @@ class ConfigTests(unittest.TestCase):
                 config = Settings.from_project(Path(temporary))
         self.assertEqual(config.mode, "paper")
         self.assertEqual(config.project_root, Path(temporary).resolve())
+        self.assertTrue(config.paper_position_review_enabled)
+        self.assertTrue(config.paper_profit_protection_enabled)
+        self.assertEqual(config.paper_commission_rate, Decimal("0.00015"))
 
     def test_live_mode_requires_exact_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

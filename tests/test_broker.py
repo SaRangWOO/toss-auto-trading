@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from toss_trader.broker import LiveBroker, OrderNotFilled
+from toss_trader.broker import LiveBroker, OrderNotFilled, PaperBroker
 
 
 class FakeOrderClient:
@@ -69,6 +69,23 @@ class LiveBrokerTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.order_id, "server-order")
         self.assertEqual(raised.exception.status, "CANCELED")
+
+
+class PaperBrokerTests(unittest.TestCase):
+    def test_paper_execution_includes_slippage_commission_and_sell_tax(self) -> None:
+        broker = PaperBroker(
+            slippage_bps=Decimal("5"),
+            commission_rate=Decimal("0.00015"),
+            sell_tax_rate=Decimal("0.0015"),
+        )
+        buy = broker.buy("005930", 10, Decimal("10000"))
+        sell = broker.sell("005930", 10, Decimal("10000"))
+        self.assertEqual(buy.price, Decimal("10005.0000"))
+        self.assertEqual(buy.commission, Decimal("15.01"))
+        self.assertEqual(buy.tax, Decimal("0"))
+        self.assertEqual(sell.price, Decimal("9995.0000"))
+        self.assertEqual(sell.commission, Decimal("14.99"))
+        self.assertEqual(sell.tax, Decimal("149.93"))
 
 
 if __name__ == "__main__":

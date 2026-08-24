@@ -64,6 +64,9 @@ class Settings:
     force_exit_time: str
     process_stop_time: str
     paper_starting_cash_krw: Decimal
+    paper_slippage_bps: Decimal
+    paper_commission_rate: Decimal
+    paper_sell_tax_rate: Decimal
     max_trade_krw: Decimal
     max_open_positions: int
     max_daily_entries: int
@@ -99,6 +102,17 @@ class Settings:
     failure_exit_enabled: bool
     failure_exit_confirmation_candles: int
     failure_exit_max_trade_pressure: Decimal
+    paper_position_review_enabled: bool
+    paper_review_5m_seconds: int
+    paper_review_10m_seconds: int
+    paper_review_min_volume_ratio: Decimal
+    paper_review_strong_volume_ratio: Decimal
+    paper_review_max_weak_trade_pressure: Decimal
+    paper_review_min_strong_trade_pressure: Decimal
+    paper_review_min_10m_return: Decimal
+    paper_profit_protection_enabled: bool
+    paper_profit_activation_rate: Decimal
+    paper_profit_max_giveback_fraction: Decimal
     min_trading_amount_krw: Decimal
     min_daily_change_rate: Decimal
     max_daily_change_rate: Decimal
@@ -139,6 +153,9 @@ class Settings:
             force_exit_time=os.getenv("FORCE_EXIT_TIME", "15:35").strip(),
             process_stop_time=os.getenv("PROCESS_STOP_TIME", "15:40").strip(),
             paper_starting_cash_krw=_decimal("PAPER_STARTING_CASH_KRW", "1000000"),
+            paper_slippage_bps=_decimal("PAPER_SLIPPAGE_BPS", "5"),
+            paper_commission_rate=_decimal("PAPER_COMMISSION_RATE", "0.00015"),
+            paper_sell_tax_rate=_decimal("PAPER_SELL_TAX_RATE", "0.0015"),
             max_trade_krw=_decimal("MAX_TRADE_KRW", "100000"),
             max_open_positions=_integer("MAX_OPEN_POSITIONS", 2),
             max_daily_entries=_integer("MAX_DAILY_ENTRIES", 2),
@@ -205,6 +222,35 @@ class Settings:
             ),
             failure_exit_max_trade_pressure=_decimal(
                 "FAILURE_EXIT_MAX_TRADE_PRESSURE", "0.45"
+            ),
+            paper_position_review_enabled=_boolean(
+                "PAPER_POSITION_REVIEW_ENABLED", True
+            ),
+            paper_review_5m_seconds=_integer("PAPER_REVIEW_5M_SECONDS", 300),
+            paper_review_10m_seconds=_integer("PAPER_REVIEW_10M_SECONDS", 600),
+            paper_review_min_volume_ratio=_decimal(
+                "PAPER_REVIEW_MIN_VOLUME_RATIO", "0.60"
+            ),
+            paper_review_strong_volume_ratio=_decimal(
+                "PAPER_REVIEW_STRONG_VOLUME_RATIO", "0.80"
+            ),
+            paper_review_max_weak_trade_pressure=_decimal(
+                "PAPER_REVIEW_MAX_WEAK_TRADE_PRESSURE", "0.45"
+            ),
+            paper_review_min_strong_trade_pressure=_decimal(
+                "PAPER_REVIEW_MIN_STRONG_TRADE_PRESSURE", "0.55"
+            ),
+            paper_review_min_10m_return=_decimal(
+                "PAPER_REVIEW_MIN_10M_RETURN", "0.003"
+            ),
+            paper_profit_protection_enabled=_boolean(
+                "PAPER_PROFIT_PROTECTION_ENABLED", True
+            ),
+            paper_profit_activation_rate=_decimal(
+                "PAPER_PROFIT_ACTIVATION_RATE", "0.008"
+            ),
+            paper_profit_max_giveback_fraction=_decimal(
+                "PAPER_PROFIT_MAX_GIVEBACK_FRACTION", "0.50"
             ),
             min_trading_amount_krw=_decimal(
                 "MIN_TRADING_AMOUNT_KRW", "50000000000"
@@ -296,6 +342,51 @@ class Settings:
             )
         if not Decimal("0") <= self.failure_exit_max_trade_pressure <= Decimal("1"):
             raise ValueError("FAILURE_EXIT_MAX_TRADE_PRESSURE must be in [0, 1]")
+        if not Decimal("0") <= self.paper_slippage_bps <= Decimal("50"):
+            raise ValueError("PAPER_SLIPPAGE_BPS must be in [0, 50]")
+        for name, value in (
+            ("PAPER_COMMISSION_RATE", self.paper_commission_rate),
+            ("PAPER_SELL_TAX_RATE", self.paper_sell_tax_rate),
+        ):
+            if not Decimal("0") <= value <= Decimal("0.01"):
+                raise ValueError(f"{name} must be in [0, 0.01]")
+        if not 120 <= self.paper_review_5m_seconds <= 900:
+            raise ValueError("PAPER_REVIEW_5M_SECONDS must be between 120 and 900")
+        if not self.paper_review_5m_seconds < self.paper_review_10m_seconds <= 1800:
+            raise ValueError(
+                "PAPER_REVIEW_10M_SECONDS must be above the 5m checkpoint and at most 1800"
+            )
+        for name, value in (
+            ("PAPER_REVIEW_MAX_WEAK_TRADE_PRESSURE", self.paper_review_max_weak_trade_pressure),
+            ("PAPER_REVIEW_MIN_STRONG_TRADE_PRESSURE", self.paper_review_min_strong_trade_pressure),
+        ):
+            if not Decimal("0") <= value <= Decimal("1"):
+                raise ValueError(f"{name} must be in [0, 1]")
+        if (
+            self.paper_review_min_strong_trade_pressure
+            <= self.paper_review_max_weak_trade_pressure
+        ):
+            raise ValueError(
+                "PAPER_REVIEW_MIN_STRONG_TRADE_PRESSURE must exceed the weak threshold"
+            )
+        if not Decimal("0") < self.paper_review_min_volume_ratio <= Decimal("3"):
+            raise ValueError("PAPER_REVIEW_MIN_VOLUME_RATIO must be in (0, 3]")
+        if not (
+            self.paper_review_min_volume_ratio
+            <= self.paper_review_strong_volume_ratio
+            <= Decimal("5")
+        ):
+            raise ValueError(
+                "PAPER_REVIEW_STRONG_VOLUME_RATIO must be at least the minimum ratio and at most 5"
+            )
+        if not Decimal("0") <= self.paper_review_min_10m_return <= Decimal("0.03"):
+            raise ValueError("PAPER_REVIEW_MIN_10M_RETURN must be in [0, 0.03]")
+        if not Decimal("0") < self.paper_profit_activation_rate <= Decimal("0.05"):
+            raise ValueError("PAPER_PROFIT_ACTIVATION_RATE must be in (0, 0.05]")
+        if not Decimal("0.10") <= self.paper_profit_max_giveback_fraction <= Decimal("0.90"):
+            raise ValueError(
+                "PAPER_PROFIT_MAX_GIVEBACK_FRACTION must be in [0.10, 0.90]"
+            )
         for name, value, upper in (
             ("MAX_DAILY_LOSS_RATE", self.max_daily_loss_rate, Decimal("0.03")),
             ("RISK_PER_TRADE_RATE", self.risk_per_trade_rate, Decimal("0.01")),

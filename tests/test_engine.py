@@ -231,6 +231,62 @@ class EngineTests(unittest.TestCase):
                 self.assertNotIn("005930", engine.state.positions)
                 self.assertIsNone(engine.state.pending_order)
 
+    def test_paper_position_review_marks_strong_trend(self) -> None:
+        class ReviewClient(FakeClient):
+            def candles(self, symbol: str, count: int) -> list[dict]:
+                rows = []
+                for index in range(20):
+                    rows.append(
+                        {
+                            "timestamp": f"2026-07-29T09:{45 + index:02d}:00+09:00"
+                            if index < 15
+                            else f"2026-07-29T10:{index - 15:02d}:00+09:00",
+                            "highPrice": "100.5",
+                            "lowPrice": "99.5",
+                            "closePrice": "100",
+                            "volume": "200" if index >= 17 else "100",
+                        }
+                    )
+                return rows
+
+            def trades(self, symbol: str, count: int) -> list[dict]:
+                return [{"price": "101", "volume": "100"}]
+
+            def orderbook(self, symbol: str) -> dict:
+                return {
+                    "asks": [{"price": "101", "volume": "100"}],
+                    "bids": [{"price": "100", "volume": "100"}],
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.managed_engine(
+                settings(Path(temporary)), ReviewClient()
+            ) as engine:
+                engine.state.trading_day = "2026-07-29"
+                engine.state.positions["005930"] = Position(
+                    symbol="005930",
+                    quantity=1,
+                    entry_price=Decimal("100"),
+                    high_water_price=Decimal("100"),
+                    opened_at="2026-07-29T10:00:00+09:00",
+                )
+                engine._manage_positions(
+                    {"005930": Decimal("101")},
+                    datetime(2026, 7, 29, 10, 5, tzinfo=KST),
+                )
+                position = engine.state.positions["005930"]
+                self.assertEqual(position.review_5m_outcome, "strong_trend")
+                self.assertTrue(position.strong_trend_confirmed)
+                review_path = (
+                    Path(temporary)
+                    / "reports"
+                    / "position_reviews"
+                    / "2026-07-29.jsonl"
+                )
+                record = json.loads(review_path.read_text(encoding="utf-8"))
+                self.assertEqual(record["checkpoint"], "5m")
+                self.assertEqual(record["outcome"], "strong_trend")
+
     def test_failure_exit_requires_two_distinct_completed_candles(self) -> None:
         class PositionClient(FakeClient):
             def __init__(self) -> None:
@@ -271,7 +327,11 @@ class EngineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             client = PositionClient()
-            with self.managed_engine(settings(Path(temporary)), client) as engine:
+            config = replace(
+                settings(Path(temporary)),
+                paper_position_review_enabled=False,
+            )
+            with self.managed_engine(config, client) as engine:
                 engine.state.trading_day = "2026-07-29"
                 engine.state.positions["005930"] = Position(
                     symbol="005930",

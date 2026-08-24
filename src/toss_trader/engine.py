@@ -23,6 +23,8 @@ from .strategy import (
     exit_reason,
     market_regime_allows,
     position_quantity,
+    position_review_evaluate,
+    recent_volume_ratio,
     rolling_vwap,
     session_breakout_allowed,
 )
@@ -106,7 +108,11 @@ class TradingEngine:
         self.broker = (
             LiveBroker(client, settings.order_timeout_seconds)
             if settings.mode == "live"
-            else PaperBroker()
+            else PaperBroker(
+                settings.paper_slippage_bps,
+                settings.paper_commission_rate,
+                settings.paper_sell_tax_rate,
+            )
         )
         self._shadow_tracking_day: str | None = None
         self._shadow_tracking: list[dict] = []
@@ -419,9 +425,17 @@ class TradingEngine:
                 self.logger.warning("POSITION_PRICE_MISSING symbol=%s", symbol)
                 continue
             position.high_water_price = max(position.high_water_price, current)
+            if overnight:
+                self._sell(symbol, current, "overnight_recovery", now)
+                continue
+            if self._force_exit_due(now):
+                self._sell(symbol, current, "intraday_force_exit", now)
+                continue
             volatility_rate = None
             dynamic_vwap = None
             trade_pressure = None
+            volume_ratio = None
+            review_reason = None
             recent_candles: list[dict] = []
             candles = getattr(self.client, "candles", None)
             if candles is not None:
@@ -429,6 +443,7 @@ class TradingEngine:
                     recent_candles = candles(symbol, count=30)
                     volatility_rate = average_true_range_rate(recent_candles, period=14)
                     dynamic_vwap = rolling_vwap(recent_candles, now, window=20)
+                    volume_ratio = recent_volume_ratio(recent_candles, now)
                     completed = completed_intraday_candles(recent_candles, now)
                     if completed:
                         latest = completed[-1]
@@ -453,10 +468,31 @@ class TradingEngine:
                         symbol,
                         type(exc).__name__,
                     )
-            if self.settings.failure_exit_enabled and (
-                position.failure_vwap_count > 0
-                or position.failure_breakout_count > 0
-            ):
+            opened_at = datetime.fromisoformat(position.opened_at)
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            elapsed_seconds = (now - opened_at).total_seconds()
+            paper_review_due = (
+                self.settings.mode == "paper"
+                and self.settings.paper_position_review_enabled
+                and (
+                    (
+                        position.review_5m_at is None
+                        and elapsed_seconds >= self.settings.paper_review_5m_seconds
+                    )
+                    or (
+                        position.review_10m_at is None
+                        and elapsed_seconds >= self.settings.paper_review_10m_seconds
+                    )
+                )
+            )
+            if (
+                self.settings.failure_exit_enabled
+                and (
+                    position.failure_vwap_count > 0
+                    or position.failure_breakout_count > 0
+                )
+            ) or paper_review_due:
                 try:
                     trade_pressure = estimated_trade_pressure(
                         self.client.trades(symbol, count=50),
@@ -467,6 +503,53 @@ class TradingEngine:
                         "POSITION_PRESSURE_UNAVAILABLE symbol=%s error=%s",
                         symbol,
                         type(exc).__name__,
+                    )
+            review = position_review_evaluate(
+                position,
+                current,
+                self.settings,
+                now,
+                current_vwap=dynamic_vwap,
+                trade_pressure=trade_pressure,
+                volume_ratio=volume_ratio,
+            )
+            if review is not None:
+                if review.data_complete:
+                    outcome = (
+                        review.exit_reason
+                        or ("strong_trend" if review.strong_trend else "hold")
+                    )
+                    if review.checkpoint == "5m":
+                        position.review_5m_at = now.isoformat(timespec="seconds")
+                        position.review_5m_outcome = outcome
+                    else:
+                        position.review_10m_at = now.isoformat(timespec="seconds")
+                        position.review_10m_outcome = outcome
+                    if review.strong_trend:
+                        position.strong_trend_confirmed = True
+                    review_reason = review.exit_reason
+                    self.logger.info(
+                        "POSITION_REVIEW mode=paper symbol=%s checkpoint=%s "
+                        "outcome=%s gain=%s pressure=%s volume=%s",
+                        symbol,
+                        review.checkpoint,
+                        outcome,
+                        review.metrics.get("gain_rate"),
+                        review.metrics.get("trade_pressure"),
+                        review.metrics.get("volume_ratio"),
+                    )
+                    self._record_position_review(
+                        symbol,
+                        review,
+                        outcome,
+                        now,
+                    )
+                else:
+                    self.logger.info(
+                        "POSITION_REVIEW_SKIP mode=paper symbol=%s checkpoint=%s "
+                        "reason=data_unavailable",
+                        symbol,
+                        review.checkpoint,
                     )
             reason = exit_reason(
                 position,
@@ -479,12 +562,39 @@ class TradingEngine:
                 trade_pressure=trade_pressure,
                 failure_exit_enabled=self.settings.failure_exit_enabled,
             )
-            if overnight:
-                reason = "overnight_recovery"
-            elif self._force_exit_due(now):
-                reason = "intraday_force_exit"
+            reason = reason or review_reason
             if reason:
                 self._sell(symbol, current, reason, now)
+
+    def _record_position_review(
+        self,
+        symbol: str,
+        review,
+        outcome: str,
+        now: datetime,
+    ) -> None:
+        """Persist completed paper checkpoints for later weekly comparison."""
+        try:
+            directory = self.settings.project_root / "reports" / "position_reviews"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"{now.date().isoformat()}.jsonl"
+            record = {
+                "timestamp": now.isoformat(timespec="seconds"),
+                "symbol": symbol,
+                "checkpoint": review.checkpoint,
+                "outcome": outcome,
+                "exit_reason": review.exit_reason,
+                "strong_trend": review.strong_trend,
+                "metrics": review.metrics,
+            }
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            self.logger.warning(
+                "POSITION_REVIEW_RECORD_FAILED symbol=%s error=%s",
+                symbol,
+                type(exc).__name__,
+            )
 
     def _daily_guard(
         self, cash: Decimal, prices: dict[str, Decimal]
