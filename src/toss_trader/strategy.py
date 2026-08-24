@@ -50,6 +50,13 @@ class AdaptiveShadowEvaluation:
     metrics: dict[str, str]
 
 
+@dataclass(frozen=True)
+class ContinuationEvaluation:
+    eligible: bool
+    rejection_reasons: tuple[str, ...]
+    metrics: dict[str, str]
+
+
 def _return(current: Decimal, previous: Decimal) -> Decimal:
     if previous <= 0:
         return ZERO
@@ -303,6 +310,57 @@ def average_true_range_rate(
     return sum(true_ranges, ZERO) / D(len(true_ranges)) / latest
 
 
+def completed_intraday_candles(
+    candles: list[dict[str, Any]], as_of: datetime
+) -> list[dict[str, Any]]:
+    """Return only completed candles from the current trading day."""
+    minute = as_of.replace(second=0, microsecond=0)
+    return [
+        item
+        for item in sorted(candles, key=lambda value: value["timestamp"])
+        if datetime.fromisoformat(str(item["timestamp"])).date() == as_of.date()
+        and datetime.fromisoformat(str(item["timestamp"])).replace(
+            second=0, microsecond=0
+        ) < minute
+    ]
+
+
+def rolling_vwap(
+    candles: list[dict[str, Any]], as_of: datetime, window: int = 20
+) -> Decimal | None:
+    completed = completed_intraday_candles(candles, as_of)[-window:]
+    total_volume = sum((D(item.get("volume", "0")) for item in completed), ZERO)
+    if not completed or total_volume <= ZERO:
+        return None
+    return sum(
+        (
+            D(item.get("closePrice", "0")) * D(item.get("volume", "0"))
+            for item in completed
+        ),
+        ZERO,
+    ) / total_volume
+
+
+def estimated_trade_pressure(
+    trades: list[dict[str, Any]], orderbook: dict[str, Any]
+) -> Decimal | None:
+    """Estimate buy pressure from trades around the midpoint; not investor flow."""
+    asks = [D(item["price"]) for item in orderbook.get("asks", [])]
+    bids = [D(item["price"]) for item in orderbook.get("bids", [])]
+    if not trades or not asks or not bids:
+        return None
+    midpoint = (min(asks) + max(bids)) / Decimal("2")
+    signed = [
+        D(item.get("volume", "0"))
+        * (Decimal("1") if D(item.get("price", "0")) >= midpoint else Decimal("-1"))
+        for item in trades
+    ]
+    gross = sum((abs(value) for value in signed), ZERO)
+    if gross <= ZERO:
+        return None
+    return _clamp((sum(signed, ZERO) / gross + Decimal("1")) / Decimal("2"))
+
+
 def session_breakout_allowed(
     candles: list[dict[str, Any]],
     as_of: datetime,
@@ -382,6 +440,107 @@ def session_breakout_allowed(
         len(confirmed) == confirmation
         and all(confirmed)
         and previous_price <= opening_high
+    )
+
+
+def continuation_entry_evaluate(
+    candles: list[dict[str, Any]],
+    evaluation: AdaptiveShadowEvaluation,
+    settings: Settings,
+    as_of: datetime,
+) -> ContinuationEvaluation:
+    """Evaluate a conservative post-breakout continuation for paper trials."""
+    today = completed_intraday_candles(candles, as_of)
+    reasons: list[str] = []
+    if len(today) < 16:
+        return ContinuationEvaluation(
+            False,
+            ("insufficient_candles",),
+            {"completed_candles": str(len(today))},
+        )
+
+    def timestamp(item: dict[str, Any]) -> datetime:
+        return datetime.fromisoformat(str(item["timestamp"]))
+
+    def high(item: dict[str, Any]) -> Decimal:
+        return D(item.get("highPrice", item.get("closePrice", "0")))
+
+    opening = [
+        item
+        for item in today
+        if timestamp(item).time().hour == 9
+        and timestamp(item).time().minute < 30
+    ]
+    if not opening:
+        return ContinuationEvaluation(
+            False,
+            ("opening_range_unavailable",),
+            {"completed_candles": str(len(today))},
+        )
+    opening_high = max((high(item) for item in opening), default=ZERO)
+    hold_count = sum(
+        D(item.get("closePrice", "0")) > opening_high for item in today[-2:]
+    )
+    if hold_count < 2:
+        reasons.append("opening_range_hold_failed")
+
+    breakout_at: datetime | None = None
+    for index, item in enumerate(today):
+        item_at = timestamp(item)
+        if item_at.time().hour < 10 or index == 0:
+            continue
+        prior_high = max((high(value) for value in today[:index]), default=ZERO)
+        if prior_high > ZERO and D(item.get("closePrice", "0")) > prior_high:
+            breakout_at = item_at
+    breakout_age = None
+    if breakout_at is None:
+        reasons.append("recent_breakout_unavailable")
+    else:
+        breakout_age = Decimal(str((as_of - breakout_at).total_seconds())) / Decimal("60")
+        if breakout_age < ZERO or breakout_age > D(
+            settings.continuation_breakout_max_age_minutes
+        ):
+            reasons.append("breakout_age_failed")
+    opening_retest_seen = False
+    if breakout_at is not None:
+        opening_retest_seen = any(
+            timestamp(item) >= breakout_at
+            and D(item.get("lowPrice", item.get("closePrice", "0")))
+            <= opening_high
+            and D(item.get("closePrice", "0")) > opening_high
+            for item in today
+        )
+
+    vwap_distance = D(evaluation.metrics.get("vwap_distance", "0"))
+    breakout_distance = D(evaluation.metrics.get("breakout_pct", "0"))
+    if evaluation.entry_score < settings.continuation_min_entry_score:
+        reasons.append("continuation_entry_score_failed")
+    if evaluation.volume_score < settings.continuation_min_volume_score:
+        reasons.append("continuation_volume_score_failed")
+    if (
+        evaluation.trade_pressure_score
+        < settings.continuation_min_trade_pressure_score
+    ):
+        reasons.append("continuation_trade_pressure_failed")
+    if evaluation.orderbook_score < settings.continuation_min_orderbook_score:
+        reasons.append("continuation_orderbook_failed")
+    if not ZERO < vwap_distance <= settings.continuation_max_vwap_distance:
+        reasons.append("continuation_vwap_distance_failed")
+    if not ZERO < breakout_distance <= settings.continuation_max_breakout_distance:
+        reasons.append("continuation_breakout_distance_failed")
+
+    return ContinuationEvaluation(
+        eligible=not reasons,
+        rejection_reasons=tuple(reasons),
+        metrics={
+            "opening_high": str(opening_high),
+            "opening_hold_count": str(hold_count),
+            "opening_retest_seen": str(opening_retest_seen).lower(),
+            "breakout_at": breakout_at.isoformat() if breakout_at else "",
+            "breakout_age_minutes": str(breakout_age) if breakout_age is not None else "",
+            "vwap_distance": str(vwap_distance),
+            "breakout_distance": str(breakout_distance),
+        },
     )
 
 
@@ -538,6 +697,7 @@ def adaptive_shadow_evaluate(
         market_context_score=market_context_score,
         entry_score=entry_score,
         metrics={
+            "reference_price": str(latest),
             "breakout_pct": str(breakout_pct),
             "volume_ratio": str(volume_ratio),
             "volume_percentile": str(volume_percentile),
@@ -553,16 +713,11 @@ def exit_reason(
     settings: Settings,
     now: datetime | None = None,
     volatility_rate: Decimal | None = None,
-    current_vwap: Decimal | None = None,
-    breakout_reference: Decimal | None = None,
+    failure_vwap_count: int = 0,
+    failure_breakout_count: int = 0,
+    trade_pressure: Decimal | None = None,
     failure_exit_enabled: bool = False,
 ) -> str | None:
-    if now is not None:
-        opened_at = datetime.fromisoformat(position.opened_at)
-        if opened_at.tzinfo is None:
-            opened_at = opened_at.replace(tzinfo=timezone.utc)
-        if (now - opened_at).total_seconds() < settings.min_hold_seconds:
-            return None
     volatility = volatility_rate or settings.min_volatility_rate
     stop_rate = max(
         settings.stop_loss_rate,
@@ -588,13 +743,26 @@ def exit_reason(
     )
     if current_price <= hard_stop:
         return "hard_stop"
+    if now is not None:
+        opened_at = datetime.fromisoformat(position.opened_at)
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        if (now - opened_at).total_seconds() < settings.min_hold_seconds:
+            return None
     if failure_exit_enabled and now is not None:
-        if current_vwap is not None and current_price < current_vwap:
+        confirmed_vwap = (
+            failure_vwap_count >= settings.failure_exit_confirmation_candles
+        )
+        confirmed_breakout = (
+            failure_breakout_count >= settings.failure_exit_confirmation_candles
+        )
+        selling_pressure = (
+            trade_pressure is not None
+            and trade_pressure <= settings.failure_exit_max_trade_pressure
+        )
+        if confirmed_vwap and (selling_pressure or confirmed_breakout):
             return "breakout_failure_vwap"
-        if (
-            breakout_reference is not None
-            and current_price < breakout_reference
-        ):
+        if confirmed_breakout and selling_pressure:
             return "breakout_failure_retest"
     if current_price >= take_profit:
         return "take_profit"

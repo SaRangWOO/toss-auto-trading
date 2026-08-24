@@ -49,18 +49,29 @@ $reportAction = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
     -Argument $reportArguments `
     -WorkingDirectory $projectRoot
+$processStopTime = [TimeSpan]::Parse("15:40")
+$envPath = Join-Path $projectRoot ".env"
+if (Test-Path -LiteralPath $envPath) {
+    $processStopLine = Get-Content -LiteralPath $envPath |
+        Where-Object { $_ -match '^\s*PROCESS_STOP_TIME\s*=\s*([0-2]\d:[0-5]\d)\s*(?:#.*)?$' } |
+        Select-Object -First 1
+    if ($processStopLine -and $processStopLine -match '^\s*PROCESS_STOP_TIME\s*=\s*([0-2]\d:[0-5]\d)') {
+        $processStopTime = [TimeSpan]::Parse($Matches[1])
+    }
+}
+$reportAt = ([DateTime]::Today.Add($processStopTime)).AddMinutes(2).ToString("HH:mm")
 $reportTrigger = New-ScheduledTaskTrigger `
     -Weekly `
     -WeeksInterval 1 `
     -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday `
-    -At "15:25"
+    -At $reportAt
 Register-ScheduledTask `
     -TaskName $reportTaskName `
     -Action $reportAction `
     -Trigger $reportTrigger `
     -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10)) `
     -Principal $principal `
-    -Description "Toss OpenAPI daily report fallback." `
+    -Description "Toss OpenAPI daily report fallback after PROCESS_STOP_TIME." `
     -Force | Out-Null
 
 Get-ScheduledTask -TaskName $reportTaskName |

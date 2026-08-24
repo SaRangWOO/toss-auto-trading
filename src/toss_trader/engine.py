@@ -14,13 +14,17 @@ from .config import Settings
 from .state import PendingOrder, PortfolioState, Position
 from .strategy import (
     MomentumSignal,
+    adaptive_shadow_evaluate,
     analyze_candidate,
     average_true_range_rate,
+    completed_intraday_candles,
+    continuation_entry_evaluate,
+    estimated_trade_pressure,
     exit_reason,
     market_regime_allows,
     position_quantity,
+    rolling_vwap,
     session_breakout_allowed,
-    adaptive_shadow_evaluate,
 )
 
 
@@ -104,6 +108,9 @@ class TradingEngine:
             if settings.mode == "live"
             else PaperBroker()
         )
+        self._shadow_tracking_day: str | None = None
+        self._shadow_tracking: list[dict] = []
+        self._continuation_confirmations: dict[str, tuple[datetime, int]] = {}
 
     def _entry_window_open(self, now: datetime) -> bool:
         current = now.timetz()
@@ -204,11 +211,12 @@ class TradingEngine:
                 + execution.commission
                 + execution.tax
             )
+            self._record_simulated_order(pending, execution, now)
         self.state.daily_entries += 1
         self.state.pending_order = None
 
     def _apply_sell_execution(
-        self, pending: PendingOrder, execution: Execution
+        self, pending: PendingOrder, execution: Execution, now: datetime
     ) -> Decimal:
         position = self.state.positions[pending.symbol]
         sold_quantity = min(execution.quantity, position.quantity)
@@ -229,6 +237,7 @@ class TradingEngine:
                 - execution.commission
                 - execution.tax
             )
+            self._record_simulated_order(pending, execution, now)
         remaining = position.quantity - sold_quantity
         if remaining == 0:
             del self.state.positions[pending.symbol]
@@ -238,6 +247,27 @@ class TradingEngine:
             position.entry_tax *= Decimal("1") - ratio
         self.state.pending_order = None
         return realized
+
+    def _record_simulated_order(
+        self, pending: PendingOrder, execution: Execution, now: datetime
+    ) -> None:
+        """Keep paper fills in the same order shape used by daily reports."""
+        self.state.simulated_orders.append(
+            {
+                "orderId": execution.order_id,
+                "symbol": pending.symbol,
+                "side": pending.side,
+                "status": "FILLED",
+                "orderedAt": now.isoformat(timespec="seconds"),
+                "reason": pending.reason,
+                "execution": {
+                    "filledQuantity": str(execution.quantity),
+                    "averageFilledPrice": str(execution.price),
+                    "commission": str(execution.commission),
+                    "tax": str(execution.tax),
+                },
+            }
+        )
 
     def _reconcile_pending(self, now: datetime) -> None:
         pending = self.state.pending_order
@@ -280,7 +310,7 @@ class TradingEngine:
             if pending.side == "BUY":
                 self._apply_buy_execution(pending, execution, now)
             elif pending.symbol in self.state.positions:
-                realized = self._apply_sell_execution(pending, execution)
+                realized = self._apply_sell_execution(pending, execution, now)
                 self.logger.info(
                     "RECOVERED_EXIT symbol=%s qty=%s pnl=%s order=%s",
                     pending.symbol,
@@ -365,7 +395,7 @@ class TradingEngine:
             self.state.save(self.settings.state_path)
             self.logger.error("EXIT_NOT_FILLED symbol=%s status=%s", symbol, exc.status)
             return
-        realized = self._apply_sell_execution(pending, execution)
+        realized = self._apply_sell_execution(pending, execution, now)
         self.logger.info(
             "EXIT mode=%s symbol=%s qty=%s price=%s pnl=%s reason=%s order=%s",
             self.settings.mode,
@@ -390,15 +420,51 @@ class TradingEngine:
                 continue
             position.high_water_price = max(position.high_water_price, current)
             volatility_rate = None
+            dynamic_vwap = None
+            trade_pressure = None
+            recent_candles: list[dict] = []
             candles = getattr(self.client, "candles", None)
             if candles is not None:
                 try:
-                    volatility_rate = average_true_range_rate(
-                        candles(symbol, count=20), period=14
-                    )
+                    recent_candles = candles(symbol, count=30)
+                    volatility_rate = average_true_range_rate(recent_candles, period=14)
+                    dynamic_vwap = rolling_vwap(recent_candles, now, window=20)
+                    completed = completed_intraday_candles(recent_candles, now)
+                    if completed:
+                        latest = completed[-1]
+                        candle_at = str(latest["timestamp"])
+                        if candle_at != position.last_failure_candle_at:
+                            close = _safe_decimal(latest.get("closePrice"))
+                            position.failure_vwap_count = (
+                                position.failure_vwap_count + 1
+                                if dynamic_vwap is not None and close < dynamic_vwap
+                                else 0
+                            )
+                            position.failure_breakout_count = (
+                                position.failure_breakout_count + 1
+                                if position.breakout_reference is not None
+                                and close < position.breakout_reference
+                                else 0
+                            )
+                            position.last_failure_candle_at = candle_at
                 except Exception as exc:
                     self.logger.warning(
                         "POSITION_VOLATILITY_UNAVAILABLE symbol=%s error=%s",
+                        symbol,
+                        type(exc).__name__,
+                    )
+            if self.settings.failure_exit_enabled and (
+                position.failure_vwap_count > 0
+                or position.failure_breakout_count > 0
+            ):
+                try:
+                    trade_pressure = estimated_trade_pressure(
+                        self.client.trades(symbol, count=50),
+                        self.client.orderbook(symbol),
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "POSITION_PRESSURE_UNAVAILABLE symbol=%s error=%s",
                         symbol,
                         type(exc).__name__,
                     )
@@ -408,8 +474,9 @@ class TradingEngine:
                 self.settings,
                 now=now,
                 volatility_rate=volatility_rate,
-                current_vwap=position.entry_vwap,
-                breakout_reference=position.breakout_reference,
+                failure_vwap_count=position.failure_vwap_count,
+                failure_breakout_count=position.failure_breakout_count,
+                trade_pressure=trade_pressure,
                 failure_exit_enabled=self.settings.failure_exit_enabled,
             )
             if overnight:
@@ -523,7 +590,11 @@ class TradingEngine:
                     exc.status,
                 )
                 continue
+            final_window = now.timetz().hour >= 14
             shadow_orderbook = None
+            continuation = None
+            continuation_confirmed = False
+            continuation_confirmation_count = 0
             if (
                 self.settings.adaptive_shadow_enabled
                 and shadow_count < self.settings.adaptive_shadow_max_candidates
@@ -541,36 +612,118 @@ class TradingEngine:
                         now,
                         True,
                     )
-                    self._record_adaptive_shadow(evaluation, now)
+                    if (
+                        self.settings.mode == "paper"
+                        and self.settings.paper_continuation_entry_enabled
+                        and not final_window
+                    ):
+                        continuation = continuation_entry_evaluate(
+                            candles,
+                            evaluation,
+                            self.settings,
+                            now,
+                        )
+                        (
+                            continuation_confirmation_count,
+                            continuation_confirmed,
+                        ) = self._update_continuation_confirmation(
+                            symbol,
+                            continuation.eligible,
+                            now,
+                        )
+                    self._record_adaptive_shadow(
+                        evaluation,
+                        now,
+                        continuation=continuation,
+                        continuation_confirmation_count=(
+                            continuation_confirmation_count
+                        ),
+                        continuation_confirmed=continuation_confirmed,
+                    )
                 except Exception as exc:
                     self.logger.warning(
                         "ADAPTIVE_SHADOW_SKIP symbol=%s error=%s",
                         symbol,
                         type(exc).__name__,
                     )
-            final_window = now.timetz().hour >= 14
-            if not session_breakout_allowed(
+            strict_breakout = session_breakout_allowed(
                 candles,
                 now,
                 final_window,
                 self.settings.breakout_confirmation_candles,
-            ):
+            )
+            paper_continuation = (
+                not strict_breakout
+                and self.settings.mode == "paper"
+                and not final_window
+                and self.state.daily_entries == 0
+                and continuation_confirmed
+            )
+            if not strict_breakout and not paper_continuation:
+                details = ""
+                if continuation is not None:
+                    details = (
+                        " continuation_reasons="
+                        + ",".join(continuation.rejection_reasons or ("confirming",))
+                        + f" confirmation={continuation_confirmation_count}/"
+                        f"{self.settings.continuation_confirmation_evaluations}"
+                    )
                 self.logger.info(
-                    "ENTRY_SKIP session_breakout_filter symbol=%s final=%s",
+                    "ENTRY_SKIP session_breakout_filter symbol=%s final=%s%s",
                     symbol,
                     final_window,
+                    details,
                 )
                 continue
+            if paper_continuation:
+                self.logger.info(
+                    "ENTRY_PATH paper_continuation symbol=%s confirmation=%s/%s",
+                    symbol,
+                    continuation_confirmation_count,
+                    self.settings.continuation_confirmation_evaluations,
+                )
             orderbook = shadow_orderbook or self.client.orderbook(symbol)
             signal = analyze_candidate(
                 ranking, candles, orderbook, self.settings, as_of=now
             )
             if signal is not None:
                 signals.append(signal)
+            elif paper_continuation:
+                self.logger.info(
+                    "ENTRY_SKIP continuation_signal_filter symbol=%s", symbol
+                )
         return sorted(signals, key=lambda item: item.score, reverse=True)
 
-    def _record_adaptive_shadow(self, evaluation, now: datetime) -> None:
-        """Persist shadow evidence without changing live eligibility or orders."""
+    def _update_continuation_confirmation(
+        self, symbol: str, eligible: bool, now: datetime
+    ) -> tuple[int, bool]:
+        if not eligible:
+            self._continuation_confirmations.pop(symbol, None)
+            return 0, False
+        previous = self._continuation_confirmations.get(symbol)
+        max_gap = max(90, self.settings.scan_interval_seconds * 3)
+        count = 1
+        if previous is not None:
+            previous_at, previous_count = previous
+            gap = (now - previous_at).total_seconds()
+            if previous_at.date() == now.date() and 0 < gap <= max_gap:
+                count = previous_count + 1
+        self._continuation_confirmations[symbol] = (now, count)
+        return (
+            count,
+            count >= self.settings.continuation_confirmation_evaluations,
+        )
+
+    def _record_adaptive_shadow(
+        self,
+        evaluation,
+        now: datetime,
+        *,
+        continuation=None,
+        continuation_confirmation_count: int = 0,
+        continuation_confirmed: bool = False,
+    ) -> None:
+        """Persist shadow and paper-continuation evidence."""
         try:
             day = now.date().isoformat()
             directory = self.settings.project_root / "reports" / "filter_funnel"
@@ -593,10 +746,148 @@ class TradingEngine:
                 },
                 "metrics": evaluation.metrics,
             }
+            if continuation is not None:
+                record["continuation"] = {
+                    "paper_only": True,
+                    "eligible": continuation.eligible,
+                    "confirmed": continuation_confirmed,
+                    "confirmation_count": continuation_confirmation_count,
+                    "morning_entry_available": self.state.daily_entries == 0,
+                    "rejection_reasons": list(continuation.rejection_reasons),
+                    "metrics": continuation.metrics,
+                }
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if evaluation.shadow_pass:
+                self._register_shadow_candidate(evaluation, now)
         except Exception as exc:
             self.logger.warning("ADAPTIVE_SHADOW_RECORD_FAILED error=%s", type(exc).__name__)
+
+    def _shadow_tracking_path(self, day: str) -> Path:
+        return (
+            self.settings.project_root
+            / "reports"
+            / "shadow_tracking"
+            / f"{day}.json"
+        )
+
+    def _ensure_shadow_tracking(self, day: str) -> None:
+        if self._shadow_tracking_day == day:
+            return
+        path = self._shadow_tracking_path(day)
+        self._shadow_tracking_day = day
+        self._shadow_tracking = []
+        if not path.exists():
+            return
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                self._shadow_tracking = loaded
+        except Exception as exc:
+            self.logger.warning(
+                "SHADOW_TRACKING_LOAD_FAILED day=%s error=%s",
+                day,
+                type(exc).__name__,
+            )
+
+    def _save_shadow_tracking(self) -> None:
+        if self._shadow_tracking_day is None:
+            return
+        path = self._shadow_tracking_path(self._shadow_tracking_day)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(self._shadow_tracking, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    def _register_shadow_candidate(self, evaluation, now: datetime) -> None:
+        reference_price = _safe_decimal(
+            evaluation.metrics.get("reference_price")
+        )
+        if reference_price <= 0:
+            return
+        day = now.date().isoformat()
+        self._ensure_shadow_tracking(day)
+        if any(
+            item.get("symbol") == evaluation.symbol
+            and not item.get("completed", False)
+            for item in self._shadow_tracking
+        ):
+            return
+        self._shadow_tracking.append(
+            {
+                "symbol": evaluation.symbol,
+                "observed_at": now.isoformat(timespec="seconds"),
+                "reference_price": str(reference_price),
+                "entry_score": str(evaluation.entry_score),
+                "forward_returns": {},
+                "mfe": "0",
+                "mae": "0",
+                "completed": False,
+            }
+        )
+        self._save_shadow_tracking()
+
+    def _update_shadow_tracking(self, now: datetime) -> None:
+        """Measure rejected/alternate candidates without influencing orders."""
+        day = now.date().isoformat()
+        self._ensure_shadow_tracking(day)
+        active = [
+            item for item in self._shadow_tracking
+            if not item.get("completed", False)
+        ]
+        if not active:
+            return
+        try:
+            quote_rows = self.client.prices(
+                sorted({str(item["symbol"]) for item in active})
+            )
+            quotes = {
+                str(item["symbol"]): _safe_decimal(item.get("lastPrice"))
+                for item in quote_rows
+            }
+        except Exception as exc:
+            self.logger.warning(
+                "SHADOW_TRACKING_PRICE_FAILED error=%s", type(exc).__name__
+            )
+            return
+
+        changed = False
+        for item in active:
+            current = quotes.get(str(item["symbol"]), Decimal("0"))
+            reference = _safe_decimal(item.get("reference_price"))
+            if current <= 0 or reference <= 0:
+                continue
+            observed_at = datetime.fromisoformat(str(item["observed_at"]))
+            elapsed_minutes = (now - observed_at).total_seconds() / 60
+            if elapsed_minutes < 0:
+                continue
+            forward_return = current / reference - Decimal("1")
+            item["mfe"] = str(max(_safe_decimal(item.get("mfe")), forward_return))
+            item["mae"] = str(min(_safe_decimal(item.get("mae")), forward_return))
+            checkpoints = item.setdefault("forward_returns", {})
+            for minute in (5, 10, 15, 30):
+                key = f"{minute}m"
+                if elapsed_minutes >= minute and key not in checkpoints:
+                    checkpoints[key] = str(forward_return)
+                    changed = True
+            if elapsed_minutes >= 30 and len(checkpoints) == 4:
+                item["completed"] = True
+                item["completed_at"] = now.isoformat(timespec="seconds")
+                changed = True
+                self.logger.info(
+                    "SHADOW_OUTCOME_COMPLETE symbol=%s r30=%s mfe=%s mae=%s",
+                    item["symbol"],
+                    checkpoints["30m"],
+                    item["mfe"],
+                    item["mae"],
+                )
+        if active:
+            changed = True
+        if changed:
+            self._save_shadow_tracking()
 
     def _fresh_entry_quote(
         self, signal: MomentumSignal, now: datetime
@@ -713,6 +1004,7 @@ class TradingEngine:
         self._reconcile_pending(now)
         if self.state.pending_order is not None:
             return
+        self._update_shadow_tracking(now)
 
         prices = self._prices_for_positions()
         self._manage_positions(prices, now)

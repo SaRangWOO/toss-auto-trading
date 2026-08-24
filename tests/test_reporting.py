@@ -51,6 +51,34 @@ class ReportingTests(unittest.TestCase):
             state.cash = Decimal("100385")
             state.realized_pnl = Decimal("400")
             state.daily_entries = 1
+            state.simulated_orders = [
+                {
+                    "orderId": "paper-buy",
+                    "symbol": "000001",
+                    "side": "BUY",
+                    "status": "FILLED",
+                    "orderedAt": "2026-07-30T10:00:00+09:00",
+                    "execution": {
+                        "filledQuantity": "2",
+                        "averageFilledPrice": "1000",
+                        "commission": "0",
+                        "tax": "0",
+                    },
+                },
+                {
+                    "orderId": "paper-sell",
+                    "symbol": "000001",
+                    "side": "SELL",
+                    "status": "FILLED",
+                    "orderedAt": "2026-07-30T10:10:00+09:00",
+                    "execution": {
+                        "filledQuantity": "2",
+                        "averageFilledPrice": "1200",
+                        "commission": "0",
+                        "tax": "0",
+                    },
+                },
+            ]
             settings = SimpleNamespace(
                 mode="paper",
                 project_root=root,
@@ -67,6 +95,9 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("net cash change", report)
             self.assertIn("daily entries: `1/10`", report)
             self.assertIn("Today's closed orders", report)
+            self.assertIn("round trips matched | 1", report)
+            self.assertIn("matched gross price P&L | 400 KRW", report)
+            self.assertIn("`paper-buy`", report)
             self.assertNotIn("TOSS_CLIENT_SECRET", report)
 
     def test_report_is_not_written_before_market_close(self) -> None:

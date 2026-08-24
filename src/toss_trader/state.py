@@ -19,6 +19,9 @@ class Position:
     opened_at: str
     entry_vwap: Decimal | None = None
     breakout_reference: Decimal | None = None
+    failure_vwap_count: int = 0
+    failure_breakout_count: int = 0
+    last_failure_candle_at: str | None = None
     entry_commission: Decimal = Decimal("0")
     entry_tax: Decimal = Decimal("0")
 
@@ -32,6 +35,9 @@ class Position:
             opened_at=str(value["opened_at"]),
             entry_vwap=(Decimal(str(value["entry_vwap"])) if value.get("entry_vwap") is not None else None),
             breakout_reference=(Decimal(str(value["breakout_reference"])) if value.get("breakout_reference") is not None else None),
+            failure_vwap_count=int(value.get("failure_vwap_count", 0)),
+            failure_breakout_count=int(value.get("failure_breakout_count", 0)),
+            last_failure_candle_at=value.get("last_failure_candle_at"),
             entry_commission=Decimal(str(value.get("entry_commission", "0"))),
             entry_tax=Decimal(str(value.get("entry_tax", "0"))),
         )
@@ -45,6 +51,9 @@ class Position:
             "opened_at": self.opened_at,
             "entry_vwap": str(self.entry_vwap) if self.entry_vwap is not None else None,
             "breakout_reference": str(self.breakout_reference) if self.breakout_reference is not None else None,
+            "failure_vwap_count": self.failure_vwap_count,
+            "failure_breakout_count": self.failure_breakout_count,
+            "last_failure_candle_at": self.last_failure_candle_at,
             "entry_commission": str(self.entry_commission),
             "entry_tax": str(self.entry_tax),
         }
@@ -101,6 +110,7 @@ class PortfolioState:
     pending_order: PendingOrder | None = None
     consecutive_errors: int = 0
     last_error: str | None = None
+    simulated_orders: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def fresh(
@@ -146,6 +156,7 @@ class PortfolioState:
             ),
             consecutive_errors=int(raw.get("consecutive_errors", 0)),
             last_error=raw.get("last_error"),
+            simulated_orders=list(raw.get("simulated_orders", [])),
         )
         if state.trading_day != trading_day and not state.positions:
             return cls.fresh(trading_day, starting_cash)
@@ -167,6 +178,7 @@ class PortfolioState:
             ),
             "consecutive_errors": self.consecutive_errors,
             "last_error": self.last_error,
+            "simulated_orders": self.simulated_orders,
             "positions": {
                 symbol: position.to_dict()
                 for symbol, position in self.positions.items()
@@ -212,3 +224,4 @@ class PortfolioState:
         self.pending_order = None
         self.consecutive_errors = 0
         self.last_error = None
+        self.simulated_orders = []

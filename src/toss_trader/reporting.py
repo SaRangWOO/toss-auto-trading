@@ -163,6 +163,8 @@ def write_daily_report(
             closed_orders = client.list_orders("CLOSED", date_from=day, date_to=day)
         except Exception as exc:
             api_error = f"{type(exc).__name__}: {exc}"
+    elif settings.mode == "paper":
+        closed_orders = list(state.simulated_orders)
 
     gross, commission, tax, matched = _closed_trade_totals(closed_orders)
     net_order_pnl = gross - commission - tax

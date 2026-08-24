@@ -85,6 +85,16 @@ LIVE_TRADING_CONFIRM=
 
 paper 주문은 5bp의 불리한 슬리피지를 적용해 즉시 체결로 모사합니다.
 실제 수수료·세금, 호가 충격과 지연을 완전히 재현하지 않습니다.
+paper 체결은 상태 파일에도 주문 형태로 저장되어 날짜별 보고서의 왕복 거래와
+체결 기준 손익 계산에 사용됩니다.
+
+paper 모드에는 2026-08-22 주간 검토에서 추가한 보수적인 오전 추세 지속
+보조 진입 실험이 포함됩니다. 최근 10분 안의 시초 박스 돌파, 박스 위 2개 봉
+유지, 높은 적응형 점수와 거래량·호가·체결 proxy, 제한된 VWAP/돌파 이격이
+2회 연속 확인되어야 하며 당일 첫 진입에만 적용됩니다. 기존 안전·유동성·시장
+국면·스프레드·리스크·최종 신호 필터는 그대로 적용되고 live에서는 이 경로를
+평가하지 않습니다. 설정값은 `.env.example`의 `PAPER_CONTINUATION_*` 항목에서
+확인할 수 있습니다.
 
 ## live 모드
 
@@ -118,6 +128,7 @@ LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY
 - 상태: `state/paper_portfolio.json` 또는 `state/live_portfolio.json`
 - 로그: `logs/trader.log` (`mode=paper|live`가 각 거래 이벤트에 포함됨)
 - 날짜별 보고서: `report/YYYY/MM/YYYY-MM-DD.md`
+- shadow 후보 사후성과: `reports/shadow_tracking/YYYY-MM-DD.json`
 - 실제 접수·미체결·체결·취소의 최종 근거: Toss WTS의 해당 계좌 주문 내역
 
 `status`는 로컬 상태만 읽습니다. live의 `report`는 계좌와 주문 API를

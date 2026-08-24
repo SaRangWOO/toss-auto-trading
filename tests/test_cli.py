@@ -43,14 +43,17 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn("-RestartCount 3", script)
         self.assertIn("TossAutoTrading-DailyReport", script)
-        self.assertIn('"15:25"', script)
+        self.assertIn("PROCESS_STOP_TIME", script)
+        self.assertIn("$reportAt", script)
 
     def test_watchdog_script_checks_heartbeat_and_restarts_runner(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         script = (project_root / "scripts" / "watchdog.ps1").read_text(
             encoding="utf-8"
         )
-        self.assertIn("live_heartbeat.json", script)
+        self.assertIn("TRADING_MODE", script)
+        self.assertIn('"${mode}_heartbeat.json"', script)
+        self.assertIn("$processRunning", script)
         self.assertIn("Start-ScheduledTask", script)
         self.assertIn("120", script)
 

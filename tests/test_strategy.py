@@ -10,13 +10,17 @@ from pathlib import Path
 from toss_trader.config import Settings
 from toss_trader.state import Position
 from toss_trader.strategy import (
+    AdaptiveShadowEvaluation,
     analyze_candidate,
     adaptive_shadow_evaluate,
-    exit_reason,
     average_true_range_rate,
-    session_breakout_allowed,
+    continuation_entry_evaluate,
+    estimated_trade_pressure,
+    exit_reason,
     market_regime_allows,
     position_quantity,
+    rolling_vwap,
+    session_breakout_allowed,
 )
 
 
@@ -55,7 +59,18 @@ def settings(root: Path) -> Settings:
         adaptive_shadow_max_candidates=10,
         adaptive_shadow_min_score=Decimal("0.65"),
         breakout_confirmation_candles=2,
+        paper_continuation_entry_enabled=True,
+        continuation_confirmation_evaluations=2,
+        continuation_breakout_max_age_minutes=10,
+        continuation_min_entry_score=Decimal("0.85"),
+        continuation_min_volume_score=Decimal("0.80"),
+        continuation_min_trade_pressure_score=Decimal("0.55"),
+        continuation_min_orderbook_score=Decimal("0.50"),
+        continuation_max_vwap_distance=Decimal("0.05"),
+        continuation_max_breakout_distance=Decimal("0.015"),
         failure_exit_enabled=True,
+        failure_exit_confirmation_candles=2,
+        failure_exit_max_trade_pressure=Decimal("0.45"),
         min_trading_amount_krw=Decimal("10000000000"),
         min_daily_change_rate=Decimal("0.02"),
         max_daily_change_rate=Decimal("0.12"),
@@ -163,6 +178,113 @@ class StrategyTests(unittest.TestCase):
             self.assertEqual(evaluation.symbol, "005930")
             self.assertGreaterEqual(evaluation.entry_score, Decimal("0"))
             self.assertIn("breakout_pct", evaluation.metrics)
+            self.assertEqual(evaluation.metrics["reference_price"], "11080")
+
+    def test_high_quality_recent_continuation_is_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            candles = [
+                {
+                    "timestamp": f"2026-08-20T09:{minute:02d}:00+09:00",
+                    "highPrice": "100",
+                    "closePrice": "99",
+                    "volume": "100",
+                }
+                for minute in range(60)
+            ]
+            candles.extend(
+                [
+                    {
+                        "timestamp": "2026-08-20T10:00:00+09:00",
+                        "highPrice": "101",
+                        "closePrice": "100.5",
+                        "volume": "500",
+                    },
+                    {
+                        "timestamp": "2026-08-20T10:01:00+09:00",
+                        "highPrice": "102",
+                        "closePrice": "101.5",
+                        "volume": "600",
+                    },
+                ]
+            )
+            evaluation = AdaptiveShadowEvaluation(
+                symbol="002990",
+                live_pass=False,
+                shadow_pass=True,
+                rejection_reasons=(),
+                breakout_score=Decimal("0.93"),
+                volume_score=Decimal("1"),
+                vwap_score=Decimal("1"),
+                orderbook_score=Decimal("0.80"),
+                trade_pressure_score=Decimal("0.66"),
+                market_context_score=Decimal("1"),
+                entry_score=Decimal("0.92"),
+                metrics={
+                    "vwap_distance": "0.04",
+                    "breakout_pct": "0.012",
+                },
+            )
+            result = continuation_entry_evaluate(
+                candles,
+                evaluation,
+                config,
+                datetime.fromisoformat("2026-08-20T10:02:03+09:00"),
+            )
+            self.assertTrue(result.eligible)
+            self.assertEqual(result.rejection_reasons, ())
+            self.assertEqual(result.metrics["opening_hold_count"], "2")
+
+    def test_continuation_rejects_stale_breakout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            candles = [
+                {
+                    "timestamp": f"2026-08-20T09:{minute:02d}:00+09:00",
+                    "highPrice": "100",
+                    "closePrice": "99",
+                    "volume": "100",
+                }
+                for minute in range(60)
+            ]
+            candles.extend(
+                [
+                    {
+                        "timestamp": "2026-08-20T10:00:00+09:00",
+                        "highPrice": "101",
+                        "closePrice": "100.5",
+                        "volume": "500",
+                    },
+                    {
+                        "timestamp": "2026-08-20T10:01:00+09:00",
+                        "highPrice": "102",
+                        "closePrice": "101.5",
+                        "volume": "600",
+                    },
+                ]
+            )
+            evaluation = AdaptiveShadowEvaluation(
+                "002990",
+                False,
+                True,
+                (),
+                Decimal("0.93"),
+                Decimal("1"),
+                Decimal("1"),
+                Decimal("0.80"),
+                Decimal("0.66"),
+                Decimal("1"),
+                Decimal("0.92"),
+                {"vwap_distance": "0.04", "breakout_pct": "0.012"},
+            )
+            result = continuation_entry_evaluate(
+                candles,
+                evaluation,
+                config,
+                datetime.fromisoformat("2026-08-20T10:15:03+09:00"),
+            )
+            self.assertFalse(result.eligible)
+            self.assertIn("breakout_age_failed", result.rejection_reasons)
 
     def test_position_size_respects_trade_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -268,10 +390,30 @@ class StrategyTests(unittest.TestCase):
             self.assertIsNone(
                 exit_reason(
                     position,
-                    Decimal("9900"),
+                    Decimal("10150"),
                     config,
                     now=datetime.fromisoformat("2026-07-29T09:32:00+09:00"),
                 )
+            )
+
+    def test_hard_stop_is_not_blocked_by_minimum_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10000"),
+                opened_at="2026-07-29T09:30:00+09:00",
+            )
+            self.assertEqual(
+                exit_reason(
+                    position,
+                    Decimal("9900"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T09:30:30+09:00"),
+                ),
+                "hard_stop",
             )
 
     def test_breakout_failure_exits_below_entry_vwap(self) -> None:
@@ -292,12 +434,69 @@ class StrategyTests(unittest.TestCase):
                     Decimal("10020"),
                     config,
                     now=datetime.fromisoformat("2026-07-29T09:40:00+09:00"),
-                    current_vwap=Decimal("10050"),
-                    breakout_reference=Decimal("10000"),
+                    failure_vwap_count=2,
+                    failure_breakout_count=0,
+                    trade_pressure=Decimal("0.40"),
                     failure_exit_enabled=True,
                 ),
                 "breakout_failure_vwap",
             )
+
+    def test_breakout_failure_waits_for_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10000"),
+                opened_at="2026-07-29T09:30:00+09:00",
+            )
+            self.assertIsNone(
+                exit_reason(
+                    position,
+                    Decimal("10010"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T09:40:00+09:00"),
+                    failure_vwap_count=1,
+                    trade_pressure=Decimal("0.20"),
+                    failure_exit_enabled=True,
+                )
+            )
+
+    def test_rolling_vwap_uses_only_completed_candles(self) -> None:
+        candles = [
+            {
+                "timestamp": "2026-07-29T10:00:00+09:00",
+                "closePrice": "100",
+                "volume": "10",
+            },
+            {
+                "timestamp": "2026-07-29T10:01:00+09:00",
+                "closePrice": "200",
+                "volume": "10",
+            },
+        ]
+        self.assertEqual(
+            rolling_vwap(
+                candles,
+                datetime.fromisoformat("2026-07-29T10:01:30+09:00"),
+            ),
+            Decimal("100"),
+        )
+
+    def test_trade_pressure_estimates_recent_buying_share(self) -> None:
+        pressure = estimated_trade_pressure(
+            [
+                {"price": "101", "volume": "3"},
+                {"price": "99", "volume": "1"},
+            ],
+            {
+                "asks": [{"price": "101", "volume": "10"}],
+                "bids": [{"price": "99", "volume": "10"}],
+            },
+        )
+        self.assertEqual(pressure, Decimal("0.75"))
 
     def test_atr_rate_uses_high_low_and_previous_close(self) -> None:
         candles = [

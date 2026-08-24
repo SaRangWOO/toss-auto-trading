@@ -7,7 +7,7 @@ from unittest.mock import patch
 from decimal import Decimal
 from pathlib import Path
 
-from toss_trader.state import PendingOrder, PortfolioState
+from toss_trader.state import PendingOrder, PortfolioState, Position
 
 
 class StateTests(unittest.TestCase):
@@ -63,6 +63,30 @@ class StateTests(unittest.TestCase):
             )
             self.assertEqual(restored.initial_equity, Decimal("204644"))
             self.assertEqual(restored.cash, Decimal("204644"))
+
+    def test_position_failure_state_and_paper_orders_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            state = PortfolioState.fresh("2026-08-19", Decimal("1000000"))
+            state.positions["005930"] = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("80000"),
+                high_water_price=Decimal("80500"),
+                opened_at="2026-08-19T10:00:00+09:00",
+                failure_vwap_count=1,
+                failure_breakout_count=2,
+                last_failure_candle_at="2026-08-19T10:05:00+09:00",
+            )
+            state.simulated_orders.append({"orderId": "paper-buy"})
+            state.save(path)
+            restored = PortfolioState.load_or_fresh(
+                path, "2026-08-19", Decimal("1000000")
+            )
+            position = restored.positions["005930"]
+            self.assertEqual(position.failure_vwap_count, 1)
+            self.assertEqual(position.failure_breakout_count, 2)
+            self.assertEqual(len(restored.simulated_orders), 1)
 
 
 if __name__ == "__main__":

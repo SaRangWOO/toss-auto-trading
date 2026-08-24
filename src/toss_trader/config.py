@@ -87,7 +87,18 @@ class Settings:
     adaptive_shadow_max_candidates: int
     adaptive_shadow_min_score: Decimal
     breakout_confirmation_candles: int
+    paper_continuation_entry_enabled: bool
+    continuation_confirmation_evaluations: int
+    continuation_breakout_max_age_minutes: int
+    continuation_min_entry_score: Decimal
+    continuation_min_volume_score: Decimal
+    continuation_min_trade_pressure_score: Decimal
+    continuation_min_orderbook_score: Decimal
+    continuation_max_vwap_distance: Decimal
+    continuation_max_breakout_distance: Decimal
     failure_exit_enabled: bool
+    failure_exit_confirmation_candles: int
+    failure_exit_max_trade_pressure: Decimal
     min_trading_amount_krw: Decimal
     min_daily_change_rate: Decimal
     max_daily_change_rate: Decimal
@@ -161,7 +172,40 @@ class Settings:
             breakout_confirmation_candles=_integer(
                 "BREAKOUT_CONFIRMATION_CANDLES", 2
             ),
+            paper_continuation_entry_enabled=_boolean(
+                "PAPER_CONTINUATION_ENTRY_ENABLED", True
+            ),
+            continuation_confirmation_evaluations=_integer(
+                "CONTINUATION_CONFIRMATION_EVALUATIONS", 2
+            ),
+            continuation_breakout_max_age_minutes=_integer(
+                "CONTINUATION_BREAKOUT_MAX_AGE_MINUTES", 10
+            ),
+            continuation_min_entry_score=_decimal(
+                "CONTINUATION_MIN_ENTRY_SCORE", "0.85"
+            ),
+            continuation_min_volume_score=_decimal(
+                "CONTINUATION_MIN_VOLUME_SCORE", "0.80"
+            ),
+            continuation_min_trade_pressure_score=_decimal(
+                "CONTINUATION_MIN_TRADE_PRESSURE_SCORE", "0.55"
+            ),
+            continuation_min_orderbook_score=_decimal(
+                "CONTINUATION_MIN_ORDERBOOK_SCORE", "0.50"
+            ),
+            continuation_max_vwap_distance=_decimal(
+                "CONTINUATION_MAX_VWAP_DISTANCE", "0.05"
+            ),
+            continuation_max_breakout_distance=_decimal(
+                "CONTINUATION_MAX_BREAKOUT_DISTANCE", "0.015"
+            ),
             failure_exit_enabled=_boolean("FAILURE_EXIT_ENABLED", True),
+            failure_exit_confirmation_candles=_integer(
+                "FAILURE_EXIT_CONFIRMATION_CANDLES", 2
+            ),
+            failure_exit_max_trade_pressure=_decimal(
+                "FAILURE_EXIT_MAX_TRADE_PRESSURE", "0.45"
+            ),
             min_trading_amount_krw=_decimal(
                 "MIN_TRADING_AMOUNT_KRW", "50000000000"
             ),
@@ -218,6 +262,40 @@ class Settings:
             raise ValueError("ADAPTIVE_SHADOW_MIN_SCORE must be in [0, 1]")
         if not 1 <= self.breakout_confirmation_candles <= 3:
             raise ValueError("BREAKOUT_CONFIRMATION_CANDLES must be between 1 and 3")
+        if not 2 <= self.continuation_confirmation_evaluations <= 3:
+            raise ValueError(
+                "CONTINUATION_CONFIRMATION_EVALUATIONS must be between 2 and 3"
+            )
+        if not 1 <= self.continuation_breakout_max_age_minutes <= 15:
+            raise ValueError(
+                "CONTINUATION_BREAKOUT_MAX_AGE_MINUTES must be between 1 and 15"
+            )
+        for name, value in (
+            ("CONTINUATION_MIN_ENTRY_SCORE", self.continuation_min_entry_score),
+            ("CONTINUATION_MIN_VOLUME_SCORE", self.continuation_min_volume_score),
+            (
+                "CONTINUATION_MIN_TRADE_PRESSURE_SCORE",
+                self.continuation_min_trade_pressure_score,
+            ),
+            (
+                "CONTINUATION_MIN_ORDERBOOK_SCORE",
+                self.continuation_min_orderbook_score,
+            ),
+        ):
+            if not Decimal("0") <= value <= Decimal("1"):
+                raise ValueError(f"{name} must be in [0, 1]")
+        if not Decimal("0") < self.continuation_max_vwap_distance <= Decimal("0.10"):
+            raise ValueError("CONTINUATION_MAX_VWAP_DISTANCE must be in (0, 0.10]")
+        if not Decimal("0") < self.continuation_max_breakout_distance <= Decimal("0.05"):
+            raise ValueError(
+                "CONTINUATION_MAX_BREAKOUT_DISTANCE must be in (0, 0.05]"
+            )
+        if not 1 <= self.failure_exit_confirmation_candles <= 3:
+            raise ValueError(
+                "FAILURE_EXIT_CONFIRMATION_CANDLES must be between 1 and 3"
+            )
+        if not Decimal("0") <= self.failure_exit_max_trade_pressure <= Decimal("1"):
+            raise ValueError("FAILURE_EXIT_MAX_TRADE_PRESSURE must be in [0, 1]")
         for name, value, upper in (
             ("MAX_DAILY_LOSS_RATE", self.max_daily_loss_rate, Decimal("0.03")),
             ("RISK_PER_TRADE_RATE", self.risk_per_trade_rate, Decimal("0.01")),
