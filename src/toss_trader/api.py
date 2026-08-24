@@ -39,7 +39,7 @@ class Token:
 
 
 class TossClient:
-    """Small standard-library client for Toss Securities OpenAPI v1.2.4."""
+    """Small standard-library client for Toss Securities OpenAPI v1.2.5."""
 
     _GROUP_TPS = {
         "AUTH": 4,
@@ -53,6 +53,8 @@ class TossClient:
         "ORDER": 2,
         "ORDER_HISTORY": 4,
         "ORDER_INFO": 2,
+        "MARKET_INDICATOR": 2,
+        "MARKET_INDICATOR_CHART": 2,
     }
 
     def __init__(
@@ -69,6 +71,20 @@ class TossClient:
         self._token: Token | None = None
         self._last_call: dict[str, float] = {}
         self.retry_enabled = True
+
+    @staticmethod
+    def _decode_body(raw: bytes, content_encoding: str | None) -> str:
+        encoding = (content_encoding or "").lower()
+        try:
+            if "gzip" in encoding or raw.startswith(b"\x1f\x8b"):
+                raw = gzip.decompress(raw)
+            elif "deflate" in encoding:
+                raw = zlib.decompress(raw)
+        except (EOFError, OSError, zlib.error):
+            # Preserve the server response for diagnostics even when a proxy
+            # supplies an incorrect Content-Encoding header.
+            pass
+        return raw.decode("utf-8", errors="replace")
 
     def _throttle(self, group: str) -> None:
         tps = self._GROUP_TPS[group]
@@ -283,10 +299,39 @@ class TossClient:
             "GET", f"/api/v1/stocks/{symbol}/warnings", "STOCK"
         )
 
+    def trades(self, symbol: str, count: int = 50) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET",
+            "/api/v1/trades",
+            "MARKET_DATA",
+            query={"symbol": symbol, "count": count},
+        )
+        return result if isinstance(result, list) else result.get("trades", [])
+
+    def stocks(self, symbols: list[str]) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET",
+            "/api/v1/stocks",
+            "STOCK",
+            query={"symbols": ",".join(symbols)},
+        )
+        return result if isinstance(result, list) else result.get("stocks", [])
+
     def kr_market_calendar(self) -> dict[str, Any]:
         return self._request(
             "GET", "/api/v1/market-calendar/KR", "MARKET_INFO"
         )
+
+    def market_indicator_candles(
+        self, symbol: str, count: int = 20
+    ) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET",
+            f"/api/v1/market-indicators/{symbol}/candles",
+            "MARKET_INDICATOR_CHART",
+            query={"interval": "1m", "count": count},
+        )
+        return result.get("candles", [])
 
     def holdings(self) -> dict[str, Any]:
         return self._request(
@@ -301,6 +346,46 @@ class TossClient:
             query={"currency": "KRW"},
             account=True,
         )
+
+    def sellable_quantity(self, symbol: str) -> Decimal:
+        result = self._request(
+            "GET",
+            "/api/v1/sellable-quantity",
+            "ORDER_INFO",
+            query={"symbol": symbol},
+            account=True,
+        )
+        return Decimal(str(result["sellableQuantity"]))
+
+    def commissions(self) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET", "/api/v1/commissions", "ORDER_INFO", account=True
+        )
+        return result if isinstance(result, list) else []
+
+    def list_orders(
+        self,
+        status: str,
+        *,
+        symbol: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET",
+            "/api/v1/orders",
+            "ORDER_HISTORY",
+            query={
+                "status": status,
+                "symbol": symbol,
+                "from": date_from,
+                "to": date_to,
+                "limit": limit,
+            },
+            account=True,
+        )
+        return result if isinstance(result, list) else result.get("orders", [])
 
     def price_limits(self, symbol: str) -> dict[str, Any]:
         return self._request(

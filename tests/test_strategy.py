@@ -9,7 +9,21 @@ from pathlib import Path
 
 from toss_trader.config import Settings
 from toss_trader.state import Position
-from toss_trader.strategy import analyze_candidate, exit_reason, position_quantity
+from toss_trader.strategy import (
+    AdaptiveShadowEvaluation,
+    analyze_candidate,
+    adaptive_shadow_evaluate,
+    average_true_range_rate,
+    continuation_entry_evaluate,
+    estimated_trade_pressure,
+    exit_reason,
+    market_regime_allows,
+    position_quantity,
+    position_review_evaluate,
+    recent_volume_ratio,
+    rolling_vwap,
+    session_breakout_allowed,
+)
 
 
 def settings(root: Path) -> Settings:
@@ -24,17 +38,55 @@ def settings(root: Path) -> Settings:
         force_exit_time="15:10",
         process_stop_time="15:20",
         paper_starting_cash_krw=Decimal("1000000"),
+        paper_slippage_bps=Decimal("5"),
+        paper_commission_rate=Decimal("0.00015"),
+        paper_sell_tax_rate=Decimal("0.0015"),
         max_trade_krw=Decimal("100000"),
         max_open_positions=2,
         max_daily_entries=3,
         max_daily_loss_rate=Decimal("0.01"),
+        max_daily_loss_krw=Decimal("0"),
         max_daily_profit_lock_rate=Decimal("0.02"),
         risk_per_trade_rate=Decimal("0.0035"),
         max_position_rate=Decimal("0.10"),
         stop_loss_rate=Decimal("0.008"),
         take_profit_rate=Decimal("0.015"),
         trailing_stop_rate=Decimal("0.006"),
+        min_hold_seconds=180,
+        min_volatility_rate=Decimal("0.004"),
+        max_stop_loss_rate=Decimal("0.020"),
+        atr_stop_multiplier=Decimal("1.5"),
+        atr_take_profit_multiplier=Decimal("2.5"),
+        atr_trailing_multiplier=Decimal("1.25"),
         ranking_count=30,
+        candle_lookback_count=200,
+        adaptive_shadow_enabled=True,
+        adaptive_shadow_max_candidates=10,
+        adaptive_shadow_min_score=Decimal("0.65"),
+        breakout_confirmation_candles=2,
+        paper_continuation_entry_enabled=True,
+        continuation_confirmation_evaluations=2,
+        continuation_breakout_max_age_minutes=10,
+        continuation_min_entry_score=Decimal("0.85"),
+        continuation_min_volume_score=Decimal("0.80"),
+        continuation_min_trade_pressure_score=Decimal("0.55"),
+        continuation_min_orderbook_score=Decimal("0.50"),
+        continuation_max_vwap_distance=Decimal("0.05"),
+        continuation_max_breakout_distance=Decimal("0.015"),
+        failure_exit_enabled=True,
+        failure_exit_confirmation_candles=2,
+        failure_exit_max_trade_pressure=Decimal("0.45"),
+        paper_position_review_enabled=True,
+        paper_review_5m_seconds=300,
+        paper_review_10m_seconds=600,
+        paper_review_min_volume_ratio=Decimal("0.60"),
+        paper_review_strong_volume_ratio=Decimal("0.80"),
+        paper_review_max_weak_trade_pressure=Decimal("0.45"),
+        paper_review_min_strong_trade_pressure=Decimal("0.55"),
+        paper_review_min_10m_return=Decimal("0.003"),
+        paper_profit_protection_enabled=True,
+        paper_profit_activation_rate=Decimal("0.008"),
+        paper_profit_max_giveback_fraction=Decimal("0.50"),
         min_trading_amount_krw=Decimal("10000000000"),
         min_daily_change_rate=Decimal("0.02"),
         max_daily_change_rate=Decimal("0.12"),
@@ -45,6 +97,16 @@ def settings(root: Path) -> Settings:
         min_volume_surge=Decimal("1.5"),
         max_spread_rate=Decimal("0.004"),
         max_price_over_vwap_rate=Decimal("0.05"),
+        institutional_proxy_filter=True,
+        min_orderbook_imbalance_rate=Decimal("0.10"),
+        min_institutional_proxy_score=3,
+        order_timeout_seconds=12,
+        max_consecutive_errors=3,
+        max_data_age_seconds=180,
+        max_entry_slippage_rate=Decimal("0.003"),
+        market_regime_filter=False,
+        min_market_5m_rate=Decimal("-0.005"),
+        min_market_15m_rate=Decimal("-0.010"),
         project_root=root,
     )
 
@@ -70,13 +132,175 @@ class StrategyTests(unittest.TestCase):
             }
             orderbook = {
                 "asks": [{"price": "10600", "volume": "100"}],
-                "bids": [{"price": "10580", "volume": "100"}],
+                "bids": [{"price": "10580", "volume": "160"}],
             }
             signal = analyze_candidate(ranking, candles, orderbook, config)
             self.assertIsNotNone(signal)
             assert signal is not None
             self.assertEqual(signal.symbol, "005930")
             self.assertGreaterEqual(signal.volume_surge, Decimal("2"))
+            self.assertEqual(signal.institutional_proxy_score, 4)
+
+    def test_institutional_proxy_blocks_weak_orderbook(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                settings(Path(temporary)), min_institutional_proxy_score=4
+            )
+            candles = [
+                {
+                    "timestamp": f"2026-07-27T09:{index:02d}:00+09:00",
+                    "closePrice": str(10000 + index * 20),
+                    "volume": "2000" if index == 29 else "1000",
+                }
+                for index in range(30)
+            ]
+            ranking = {
+                "symbol": "005930",
+                "price": {"changeRate": "0.05"},
+                "tradingAmount": "50000000000",
+            }
+            weak_orderbook = {
+                "asks": [{"price": "10600", "volume": "150"}],
+                "bids": [{"price": "10580", "volume": "100"}],
+            }
+            self.assertIsNone(
+                analyze_candidate(ranking, candles, weak_orderbook, config)
+            )
+
+    def test_adaptive_shadow_returns_component_scores_without_live_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            candles = [
+                {
+                    "timestamp": f"2026-07-29T10:{index:02d}:00+09:00",
+                    "highPrice": str(10000 + index * 20 + (500 if index == 29 else 0)),
+                    "closePrice": str(10000 + index * 20 + (500 if index == 29 else 0)),
+                    "volume": str(1000 + index * 10),
+                }
+                for index in range(30)
+            ]
+            evaluation = adaptive_shadow_evaluate(
+                {"symbol": "005930", "tradingAmount": "50000000000"},
+                candles,
+                {
+                    "asks": [{"price": "11000", "volume": "100"}],
+                    "bids": [{"price": "10980", "volume": "250"}],
+                },
+                [{"price": "11000", "volume": "100"}],
+                config,
+                datetime.fromisoformat("2026-07-29T10:30:00+09:00"),
+                True,
+            )
+            self.assertEqual(evaluation.symbol, "005930")
+            self.assertGreaterEqual(evaluation.entry_score, Decimal("0"))
+            self.assertIn("breakout_pct", evaluation.metrics)
+            self.assertEqual(evaluation.metrics["reference_price"], "11080")
+
+    def test_high_quality_recent_continuation_is_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            candles = [
+                {
+                    "timestamp": f"2026-08-20T09:{minute:02d}:00+09:00",
+                    "highPrice": "100",
+                    "closePrice": "99",
+                    "volume": "100",
+                }
+                for minute in range(60)
+            ]
+            candles.extend(
+                [
+                    {
+                        "timestamp": "2026-08-20T10:00:00+09:00",
+                        "highPrice": "101",
+                        "closePrice": "100.5",
+                        "volume": "500",
+                    },
+                    {
+                        "timestamp": "2026-08-20T10:01:00+09:00",
+                        "highPrice": "102",
+                        "closePrice": "101.5",
+                        "volume": "600",
+                    },
+                ]
+            )
+            evaluation = AdaptiveShadowEvaluation(
+                symbol="002990",
+                live_pass=False,
+                shadow_pass=True,
+                rejection_reasons=(),
+                breakout_score=Decimal("0.93"),
+                volume_score=Decimal("1"),
+                vwap_score=Decimal("1"),
+                orderbook_score=Decimal("0.80"),
+                trade_pressure_score=Decimal("0.66"),
+                market_context_score=Decimal("1"),
+                entry_score=Decimal("0.92"),
+                metrics={
+                    "vwap_distance": "0.04",
+                    "breakout_pct": "0.012",
+                },
+            )
+            result = continuation_entry_evaluate(
+                candles,
+                evaluation,
+                config,
+                datetime.fromisoformat("2026-08-20T10:02:03+09:00"),
+            )
+            self.assertTrue(result.eligible)
+            self.assertEqual(result.rejection_reasons, ())
+            self.assertEqual(result.metrics["opening_hold_count"], "2")
+
+    def test_continuation_rejects_stale_breakout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            candles = [
+                {
+                    "timestamp": f"2026-08-20T09:{minute:02d}:00+09:00",
+                    "highPrice": "100",
+                    "closePrice": "99",
+                    "volume": "100",
+                }
+                for minute in range(60)
+            ]
+            candles.extend(
+                [
+                    {
+                        "timestamp": "2026-08-20T10:00:00+09:00",
+                        "highPrice": "101",
+                        "closePrice": "100.5",
+                        "volume": "500",
+                    },
+                    {
+                        "timestamp": "2026-08-20T10:01:00+09:00",
+                        "highPrice": "102",
+                        "closePrice": "101.5",
+                        "volume": "600",
+                    },
+                ]
+            )
+            evaluation = AdaptiveShadowEvaluation(
+                "002990",
+                False,
+                True,
+                (),
+                Decimal("0.93"),
+                Decimal("1"),
+                Decimal("1"),
+                Decimal("0.80"),
+                Decimal("0.66"),
+                Decimal("1"),
+                Decimal("0.92"),
+                {"vwap_distance": "0.04", "breakout_pct": "0.012"},
+            )
+            result = continuation_entry_evaluate(
+                candles,
+                evaluation,
+                config,
+                datetime.fromisoformat("2026-08-20T10:15:03+09:00"),
+            )
+            self.assertFalse(result.eligible)
+            self.assertIn("breakout_age_failed", result.rejection_reasons)
 
     def test_position_size_respects_trade_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -157,7 +381,10 @@ class StrategyTests(unittest.TestCase):
 
     def test_trailing_stop_only_arms_after_gain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            config = settings(Path(temporary))
+            config = replace(
+                settings(Path(temporary)),
+                paper_profit_protection_enabled=False,
+            )
             position = Position(
                 symbol="005930",
                 quantity=10,
@@ -167,6 +394,348 @@ class StrategyTests(unittest.TestCase):
             )
             self.assertEqual(
                 exit_reason(position, Decimal("10039"), config), "trailing_stop"
+            )
+
+    def test_profit_giveback_protects_an_armed_paper_gain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10100"),
+                opened_at="2026-07-29T10:00:00+09:00",
+            )
+            self.assertEqual(
+                exit_reason(
+                    position,
+                    Decimal("10040"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T10:06:00+09:00"),
+                ),
+                "paper_profit_giveback",
+            )
+
+    def test_strong_paper_trend_bypasses_fixed_take_profit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10200"),
+                opened_at="2026-07-29T10:00:00+09:00",
+                strong_trend_confirmed=True,
+            )
+            self.assertIsNone(
+                exit_reason(
+                    position,
+                    Decimal("10150"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T10:10:00+09:00"),
+                )
+            )
+
+    def test_live_mode_ignores_paper_review_and_profit_protection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(settings(Path(temporary)), mode="live")
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10100"),
+                opened_at="2026-07-29T10:00:00+09:00",
+            )
+            self.assertIsNone(
+                position_review_evaluate(
+                    position,
+                    Decimal("10040"),
+                    config,
+                    datetime.fromisoformat("2026-07-29T10:06:00+09:00"),
+                    current_vwap=Decimal("10050"),
+                    trade_pressure=Decimal("0.40"),
+                    volume_ratio=Decimal("0.50"),
+                )
+            )
+            self.assertIsNone(
+                exit_reason(
+                    position,
+                    Decimal("10040"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T10:06:00+09:00"),
+                )
+            )
+
+    def test_five_minute_review_exits_when_two_signals_are_weak(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10020"),
+                opened_at="2026-07-29T10:00:00+09:00",
+            )
+            review = position_review_evaluate(
+                position,
+                Decimal("10020"),
+                config,
+                datetime.fromisoformat("2026-07-29T10:05:00+09:00"),
+                current_vwap=Decimal("10040"),
+                trade_pressure=Decimal("0.40"),
+                volume_ratio=Decimal("0.90"),
+            )
+            assert review is not None
+            self.assertTrue(review.data_complete)
+            self.assertEqual(review.exit_reason, "paper_review_5m_weak")
+
+    def test_five_minute_review_identifies_a_strong_trend(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10100"),
+                opened_at="2026-07-29T10:00:00+09:00",
+            )
+            review = position_review_evaluate(
+                position,
+                Decimal("10100"),
+                config,
+                datetime.fromisoformat("2026-07-29T10:05:00+09:00"),
+                current_vwap=Decimal("10040"),
+                trade_pressure=Decimal("0.70"),
+                volume_ratio=Decimal("1.10"),
+            )
+            assert review is not None
+            self.assertTrue(review.strong_trend)
+            self.assertIsNone(review.exit_reason)
+
+    def test_ten_minute_review_requires_followthrough(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10020"),
+                opened_at="2026-07-29T10:00:00+09:00",
+                review_5m_at="2026-07-29T10:05:00+09:00",
+                review_5m_outcome="hold",
+            )
+            review = position_review_evaluate(
+                position,
+                Decimal("10010"),
+                config,
+                datetime.fromisoformat("2026-07-29T10:10:00+09:00"),
+                current_vwap=Decimal("10000"),
+                trade_pressure=Decimal("0.40"),
+                volume_ratio=Decimal("0.90"),
+            )
+            assert review is not None
+            self.assertEqual(
+                review.exit_reason,
+                "paper_review_10m_no_followthrough",
+            )
+
+    def test_recent_volume_ratio_uses_completed_candles(self) -> None:
+        candles = [
+            {
+                "timestamp": f"2026-07-29T10:{minute:02d}:00+09:00",
+                "closePrice": "100",
+                "volume": "200" if minute >= 10 else "100",
+            }
+            for minute in range(13)
+        ]
+        self.assertEqual(
+            recent_volume_ratio(
+                candles,
+                datetime.fromisoformat("2026-07-29T10:13:30+09:00"),
+            ),
+            Decimal("2"),
+        )
+
+    def test_minimum_hold_blocks_fast_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10000"),
+                opened_at="2026-07-29T09:30:00+09:00",
+            )
+            self.assertIsNone(
+                exit_reason(
+                    position,
+                    Decimal("10150"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T09:32:00+09:00"),
+                )
+            )
+
+    def test_hard_stop_is_not_blocked_by_minimum_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10000"),
+                opened_at="2026-07-29T09:30:00+09:00",
+            )
+            self.assertEqual(
+                exit_reason(
+                    position,
+                    Decimal("9900"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T09:30:30+09:00"),
+                ),
+                "hard_stop",
+            )
+
+    def test_breakout_failure_exits_below_entry_vwap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10000"),
+                opened_at="2026-07-29T09:30:00+09:00",
+                entry_vwap=Decimal("10050"),
+                breakout_reference=Decimal("10000"),
+            )
+            self.assertEqual(
+                exit_reason(
+                    position,
+                    Decimal("10020"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T09:40:00+09:00"),
+                    failure_vwap_count=2,
+                    failure_breakout_count=0,
+                    trade_pressure=Decimal("0.40"),
+                    failure_exit_enabled=True,
+                ),
+                "breakout_failure_vwap",
+            )
+
+    def test_breakout_failure_waits_for_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            position = Position(
+                symbol="005930",
+                quantity=1,
+                entry_price=Decimal("10000"),
+                high_water_price=Decimal("10000"),
+                opened_at="2026-07-29T09:30:00+09:00",
+            )
+            self.assertIsNone(
+                exit_reason(
+                    position,
+                    Decimal("10010"),
+                    config,
+                    now=datetime.fromisoformat("2026-07-29T09:40:00+09:00"),
+                    failure_vwap_count=1,
+                    trade_pressure=Decimal("0.20"),
+                    failure_exit_enabled=True,
+                )
+            )
+
+    def test_rolling_vwap_uses_only_completed_candles(self) -> None:
+        candles = [
+            {
+                "timestamp": "2026-07-29T10:00:00+09:00",
+                "closePrice": "100",
+                "volume": "10",
+            },
+            {
+                "timestamp": "2026-07-29T10:01:00+09:00",
+                "closePrice": "200",
+                "volume": "10",
+            },
+        ]
+        self.assertEqual(
+            rolling_vwap(
+                candles,
+                datetime.fromisoformat("2026-07-29T10:01:30+09:00"),
+            ),
+            Decimal("100"),
+        )
+
+    def test_trade_pressure_estimates_recent_buying_share(self) -> None:
+        pressure = estimated_trade_pressure(
+            [
+                {"price": "101", "volume": "3"},
+                {"price": "99", "volume": "1"},
+            ],
+            {
+                "asks": [{"price": "101", "volume": "10"}],
+                "bids": [{"price": "99", "volume": "10"}],
+            },
+        )
+        self.assertEqual(pressure, Decimal("0.75"))
+
+    def test_atr_rate_uses_high_low_and_previous_close(self) -> None:
+        candles = [
+            {
+                "timestamp": f"2026-07-29T09:{index:02d}:00+09:00",
+                "highPrice": "110",
+                "lowPrice": "90",
+                "closePrice": "100",
+            }
+            for index in range(15)
+        ]
+        self.assertEqual(average_true_range_rate(candles, period=14), Decimal("0.2"))
+
+    def test_session_breakout_requires_opening_range_break(self) -> None:
+        candles = [
+            {
+                "timestamp": f"2026-07-29T09:{minute:02d}:00+09:00",
+                "highPrice": "103",
+                "closePrice": "102",
+                "volume": "1000",
+            }
+            for minute in range(30)
+        ]
+        candles.append(
+            {
+                "timestamp": "2026-07-29T10:05:00+09:00",
+                "highPrice": "105",
+                "closePrice": "104",
+                "volume": "2000",
+            }
+        )
+        self.assertTrue(
+            session_breakout_allowed(
+                candles,
+                datetime.fromisoformat("2026-07-29T10:06:00+09:00"),
+                False,
+            )
+        )
+
+    def test_market_regime_blocks_when_both_indices_sell_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            now = datetime(2026, 7, 29, 9, 50, tzinfo=timezone.utc)
+            candles = []
+            for index in range(20):
+                candles.append(
+                    {
+                        "timestamp": (
+                            datetime(2026, 7, 29, 9, 30, tzinfo=timezone.utc)
+                            .replace(minute=30 + index)
+                            .isoformat()
+                        ),
+                        "closePrice": str(1000 - index * 2),
+                        "volume": "1000",
+                    }
+                )
+            self.assertFalse(
+                market_regime_allows(
+                    {"KOSPI": candles, "KOSDAQ": candles}, config, now
+                )
             )
 
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -14,6 +17,18 @@ class Position:
     entry_price: Decimal
     high_water_price: Decimal
     opened_at: str
+    entry_vwap: Decimal | None = None
+    breakout_reference: Decimal | None = None
+    failure_vwap_count: int = 0
+    failure_breakout_count: int = 0
+    last_failure_candle_at: str | None = None
+    review_5m_at: str | None = None
+    review_5m_outcome: str | None = None
+    review_10m_at: str | None = None
+    review_10m_outcome: str | None = None
+    strong_trend_confirmed: bool = False
+    entry_commission: Decimal = Decimal("0")
+    entry_tax: Decimal = Decimal("0")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "Position":
@@ -23,6 +38,18 @@ class Position:
             entry_price=Decimal(str(value["entry_price"])),
             high_water_price=Decimal(str(value["high_water_price"])),
             opened_at=str(value["opened_at"]),
+            entry_vwap=(Decimal(str(value["entry_vwap"])) if value.get("entry_vwap") is not None else None),
+            breakout_reference=(Decimal(str(value["breakout_reference"])) if value.get("breakout_reference") is not None else None),
+            failure_vwap_count=int(value.get("failure_vwap_count", 0)),
+            failure_breakout_count=int(value.get("failure_breakout_count", 0)),
+            last_failure_candle_at=value.get("last_failure_candle_at"),
+            review_5m_at=value.get("review_5m_at"),
+            review_5m_outcome=value.get("review_5m_outcome"),
+            review_10m_at=value.get("review_10m_at"),
+            review_10m_outcome=value.get("review_10m_outcome"),
+            strong_trend_confirmed=bool(value.get("strong_trend_confirmed", False)),
+            entry_commission=Decimal(str(value.get("entry_commission", "0"))),
+            entry_tax=Decimal(str(value.get("entry_tax", "0"))),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -32,6 +59,57 @@ class Position:
             "entry_price": str(self.entry_price),
             "high_water_price": str(self.high_water_price),
             "opened_at": self.opened_at,
+            "entry_vwap": str(self.entry_vwap) if self.entry_vwap is not None else None,
+            "breakout_reference": str(self.breakout_reference) if self.breakout_reference is not None else None,
+            "failure_vwap_count": self.failure_vwap_count,
+            "failure_breakout_count": self.failure_breakout_count,
+            "last_failure_candle_at": self.last_failure_candle_at,
+            "review_5m_at": self.review_5m_at,
+            "review_5m_outcome": self.review_5m_outcome,
+            "review_10m_at": self.review_10m_at,
+            "review_10m_outcome": self.review_10m_outcome,
+            "strong_trend_confirmed": self.strong_trend_confirmed,
+            "entry_commission": str(self.entry_commission),
+            "entry_tax": str(self.entry_tax),
+        }
+
+
+@dataclass
+class PendingOrder:
+    client_order_id: str
+    symbol: str
+    side: str
+    quantity: int
+    created_at: str
+    reference_price: Decimal
+    order_id: str | None = None
+    reason: str | None = None
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "PendingOrder":
+        return cls(
+            client_order_id=str(value["client_order_id"]),
+            symbol=str(value["symbol"]),
+            side=str(value["side"]),
+            quantity=int(value["quantity"]),
+            created_at=str(value["created_at"]),
+            reference_price=Decimal(
+                str(value.get("reference_price", value.get("price", "0")))
+            ),
+            order_id=value.get("order_id"),
+            reason=value.get("reason"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "client_order_id": self.client_order_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "quantity": self.quantity,
+            "created_at": self.created_at,
+            "reference_price": str(self.reference_price),
+            "order_id": self.order_id,
+            "reason": self.reason,
         }
 
 
@@ -49,10 +127,11 @@ class PortfolioState:
     sync_reason: str | None = None
     pending_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
     recovery_required: list[str] = field(default_factory=list)
-    pending_order: dict[str, Any] | None = None
     blocked_symbols: dict[str, str] = field(default_factory=dict)
-    last_error: str | None = None
+    pending_order: PendingOrder | None = None
     consecutive_errors: int = 0
+    last_error: str | None = None
+    simulated_orders: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def fresh(
@@ -68,9 +147,13 @@ class PortfolioState:
     def load_or_fresh(
         cls, path: Path, trading_day: str, starting_cash: Decimal
     ) -> "PortfolioState":
-        if not path.exists():
+        candidates = [path]
+        candidates.extend(path.parent.glob(f"{path.name}.recovery.*.json"))
+        candidates = [candidate for candidate in candidates if candidate.exists()]
+        if not candidates:
             return cls.fresh(trading_day, starting_cash)
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        source = max(candidates, key=lambda candidate: candidate.stat().st_mtime_ns)
+        raw = json.loads(source.read_text(encoding="utf-8"))
         state = cls(
             trading_day=str(raw["trading_day"]),
             initial_equity=Decimal(str(raw["initial_equity"])),
@@ -86,14 +169,24 @@ class PortfolioState:
             sync_status=str(raw.get("sync_status", "NOT_STARTED")),
             sync_reason=raw.get("sync_reason"),
             pending_orders=dict(raw.get("pending_orders", {})),
-            recovery_required=[str(item) for item in raw.get("recovery_required", [])],
-            pending_order=raw.get("pending_order"),
-            blocked_symbols=dict(raw.get("blocked_symbols", {})),
-            last_error=raw.get("last_error"),
+            recovery_required=[
+                str(item) for item in raw.get("recovery_required", [])
+            ],
+            blocked_symbols={
+                str(symbol): str(reason)
+                for symbol, reason in raw.get("blocked_symbols", {}).items()
+            },
+            pending_order=(
+                PendingOrder.from_dict(raw["pending_order"])
+                if raw.get("pending_order")
+                else None
+            ),
             consecutive_errors=int(raw.get("consecutive_errors", 0)),
+            last_error=raw.get("last_error"),
+            simulated_orders=list(raw.get("simulated_orders", [])),
         )
         if state.trading_day != trading_day and not state.positions:
-            return cls.fresh(trading_day, state.cash)
+            return cls.fresh(trading_day, starting_cash)
         return state
 
     def save(self, path: Path) -> None:
@@ -110,21 +203,44 @@ class PortfolioState:
             "sync_reason": self.sync_reason,
             "pending_orders": self.pending_orders,
             "recovery_required": self.recovery_required,
-            "pending_order": self.pending_order,
             "blocked_symbols": self.blocked_symbols,
-            "last_error": self.last_error,
+            "pending_order": (
+                self.pending_order.to_dict() if self.pending_order else None
+            ),
             "consecutive_errors": self.consecutive_errors,
+            "last_error": self.last_error,
+            "simulated_orders": self.simulated_orders,
             "positions": {
                 symbol: position.to_dict()
                 for symbol, position in self.positions.items()
             },
         }
-        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary = path.with_name(
+            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        temporary.replace(path)
+        last_error: OSError | None = None
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                if attempt == 4:
+                    break
+                time.sleep(0.2 * (attempt + 1))
+        if last_error is not None:
+            recovery = path.with_name(
+                f"{path.name}.recovery.{os.getpid()}.{uuid.uuid4().hex}.json"
+            )
+            try:
+                os.replace(temporary, recovery)
+                return
+            except OSError:
+                raise last_error
 
     def roll_to_new_day(self, trading_day: str, starting_equity: Decimal) -> None:
         if self.positions:
@@ -135,3 +251,8 @@ class PortfolioState:
         self.daily_entries = 0
         self.entries_halted = False
         self.halt_reason = None
+        self.blocked_symbols = {}
+        self.pending_order = None
+        self.consecutive_errors = 0
+        self.last_error = None
+        self.simulated_orders = []

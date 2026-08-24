@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import BinaryIO
 
 from .api import TossApiError, TossClient
 from .config import Settings
-from .engine import TradingEngine
+from .engine import TradingEngine, configure_logging
 from .reconciliation import parse_account_snapshot
+from .reporting import write_daily_report
+from .state import PortfolioState
 
 
 KST = timezone(timedelta(hours=9))
@@ -39,6 +43,52 @@ def _masked_account(account_no: str) -> str:
     if len(account_no) <= 4:
         return "*" * len(account_no)
     return "*" * (len(account_no) - 4) + account_no[-4:]
+
+
+class SingleInstanceLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.handle: BinaryIO | None = None
+
+    def __enter__(self) -> "SingleInstanceLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+b")
+        self.handle.seek(0, os.SEEK_END)
+        if self.handle.tell() == 0:
+            self.handle.write(b"0")
+            self.handle.flush()
+        self.handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.handle.close()
+            self.handle = None
+            raise RuntimeError(
+                "Another trading process is already running for this mode."
+            ) from exc
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        if self.handle is None:
+            return
+        self.handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        self.handle.close()
+        self.handle = None
 
 
 def command_check(settings: Settings) -> int:
@@ -90,8 +140,24 @@ def command_status(settings: Settings) -> int:
     return 0
 
 
-def _save_verify_journal(settings: Settings, value: dict | None) -> None:
+def command_report(settings: Settings) -> int:
+    engine = TradingEngine(settings, _client(settings))
+    path = write_daily_report(settings, engine.state, engine.client)
+    print(path)
+
+
+def _save_verify_journal(
+    settings: Settings,
+    value: dict | None,
+    *,
+    starting_cash: Decimal | None = None,
+) -> None:
     payload: dict = {}
+    if not settings.state_path.exists():
+        PortfolioState.fresh(
+            datetime.now(KST).date().isoformat(),
+            starting_cash or Decimal("0"),
+        ).save(settings.state_path)
     if settings.state_path.exists():
         payload = json.loads(settings.state_path.read_text(encoding="utf-8"))
     payload["pending_order"] = value
@@ -184,6 +250,7 @@ def command_verify_live_order(settings: Settings, args: argparse.Namespace) -> i
             "client_order_id": client_order_id,
             "created_at": datetime.now(KST).isoformat(),
         },
+        starting_cash=snapshot.cash,
     )
     try:
         created = client.create_order(
@@ -269,7 +336,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "command",
-        choices=("check", "scan", "once", "run", "status", "verify-live-order"),
+        choices=(
+            "check",
+            "scan",
+            "once",
+            "run",
+            "status",
+            "report",
+            "verify-live-order",
+        ),
         help=(
             "check=인증 점검, scan=후보 조회, once=1회 실행, "
             "run=반복 실행, status=로컬 상태"
@@ -301,21 +376,37 @@ def main() -> int:
             return command_scan(settings)
         if args.command == "status":
             return command_status(settings)
+        if args.command == "report":
+            return command_report(settings)
         if args.command == "verify-live-order":
             if args.symbol is None or args.quantity is None or args.side is None:
                 raise ValueError("verify-live-order 필수 인자가 누락되었습니다.")
             return command_verify_live_order(settings, args)
-        engine = TradingEngine(settings, _client(settings))
-        if args.command == "once":
-            engine.run_once()
+        lock_path = (
+            settings.project_root / "state" / f"{settings.mode}_trader.lock"
+        )
+        with SingleInstanceLock(lock_path):
+            engine = TradingEngine(settings, _client(settings))
+            if args.command == "once":
+                engine.run_once()
+                return 0
+            engine.run_forever()
             return 0
-        engine.run_forever()
-        return 0
     except KeyboardInterrupt:
         print("\n사용자 요청으로 종료했습니다.")
         return 130
     except (ValueError, TossApiError, RuntimeError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        # Scheduled Task only exposes the exit code. Keep unexpected failures
+        # in the operational log before returning a non-zero code.
+        try:
+            logger = configure_logging(args.project_root)
+            logger.exception("CLI_FATAL error=%s", exc)
+        except Exception:
+            pass
+        print(f"Unexpected error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
 

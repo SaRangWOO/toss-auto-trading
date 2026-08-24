@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-07-31T09:01:03+09:00",
+  "regime_adaptive_shadow_ready": true,
+  "live_trading_changed": false,
+  "actual_orders_sent": 0,
+  "regime": "NORMAL",
+  "market_snapshot": {
+    "kospi_5m": 0.012034171236340319,
+    "kospi_15m": 0.011232673480211508,
+    "kospi_30m": 0.009664186514148243,
+    "kosdaq_5m": 0.03330387459881856,
+    "kosdaq_15m": 0.03452290402198033,
+    "kosdaq_30m": 0.033015577772611104,
+    "market_1m_volatility": 0.0076331441374238,
+    "ranking_breadth": 0.9
+  },
+  "current_strategy": {
+    "market_gate": false,
+    "candidate_count": 0,
+    "symbols": []
+  },
+  "adaptive_strategy": {
+    "candidate_count": 0,
+    "candidates": []
+  },
+  "limitations": [
+    "ranking breadth is calculated from the returned ranking sample, not the whole market",
+    "no future data or actual order result is used",
+    "adaptive parameters are shadow-only and not connected to live orders"
+  ]
+}

@@ -1,13 +1,23 @@
 # Next task
 
-Validate the read-only account, holdings, pending-order, buying-power, price-limit, and orderbook response shapes in a Toss paper or otherwise authorized environment. Confirm the production order schema and account permissions, then perform one approved one-share verification order and reconcile its order/holding state before resuming automation.
+Collect paper-only continuation and position-review episodes without changing
+thresholds until at least 20 distinct review checkpoints are available.
 
-Command shape:
+Compare:
 
-```powershell
-.\scripts\run.cmd verify-live-order --symbol 090710 --quantity 1 --side BUY --order-type LIMIT --price-source BEST_ASK --no-retry --confirm LIVE-ORDER-090710-1
-```
+- strict breakout vs continuation entries;
+- 5m/10m review outcomes and subsequent 5/10/15/30-minute returns;
+- fixed exits vs strong-trend MFE giveback behavior;
+- modeled after-cost P&L, MFE, and MAE;
+- API/data-unavailable rates.
 
-Do not run this while any recurring live process, scheduled task, open order, pending journal, or existing holding for `090710` is present. If the command reports `ORDER_STATUS_UNKNOWN`, do not rerun it; reconcile the order by `clientOrderId`/`orderId` first.
+Do not promote the paper paths to live before at least 50 qualifying episodes,
+positive after-cost expectancy, acceptable tail MAE, and a separate live
+15:35 force-exit verification.
 
-Do not enable live orders as part of this validation.
+Separately, validate read-only Toss account, holdings, pending-order,
+buying-power, price-limit, and orderbook response shapes in an authorized
+environment. The one-share `verify-live-order` command must never be run while
+a recurring live process, open order, pending journal, or existing holding for
+the symbol is present. Do not enable recurring live orders as part of that
+validation.

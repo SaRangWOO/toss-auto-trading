@@ -101,6 +101,11 @@ def reconcile_portfolio(
     """Apply broker truth to local state and return auditable discrepancy reasons."""
     reasons: list[str] = []
     now = now or datetime.now(timezone.utc)
+    preexisting_halt_reason = state.halt_reason
+    preexisting_halted = state.entries_halted and preexisting_halt_reason not in {
+        "account_state_degraded",
+        "account_sync_failed",
+    }
     state.sync_status = SyncStatus.IN_PROGRESS.value
     state.cash = snapshot.cash
     state.recovery_required = []
@@ -149,6 +154,13 @@ def reconcile_portfolio(
     state.trading_day = trading_day
     state.sync_status = SyncStatus.SUCCEEDED.value if not reasons else SyncStatus.DEGRADED.value
     state.sync_reason = ";".join(reasons) or None
-    state.entries_halted = bool(reasons)
-    state.halt_reason = "account_state_degraded" if reasons else state.halt_reason
+    if reasons:
+        state.entries_halted = True
+        state.halt_reason = "account_state_degraded"
+    elif preexisting_halted:
+        state.entries_halted = True
+        state.halt_reason = preexisting_halt_reason
+    else:
+        state.entries_halted = False
+        state.halt_reason = None
     return reasons

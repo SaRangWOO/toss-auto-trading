@@ -97,6 +97,14 @@ class ReconciliationTests(unittest.TestCase):
         reconcile_portfolio(current, snapshot(cash="123456"), trading_day="2026-07-29")
         self.assertEqual(current.cash, Decimal("123456"))
 
+    def test_clean_sync_does_not_clear_a_strategy_risk_halt(self):
+        current = state()
+        current.entries_halted = True
+        current.halt_reason = "daily_loss_limit"
+        reconcile_portfolio(current, snapshot(), trading_day="2026-07-29")
+        self.assertTrue(current.entries_halted)
+        self.assertEqual(current.halt_reason, "daily_loss_limit")
+
     def test_recovered_position_has_a_crash_safe_timestamp(self):
         current = state()
         reconcile_portfolio(current, snapshot([{"symbol": "005930", "quantity": "1", "averagePrice": "10000"}]), trading_day="2026-07-29", now=datetime(2026, 7, 29, tzinfo=timezone.utc))
