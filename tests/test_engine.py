@@ -11,8 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from toss_trader.api import TossApiError
 from toss_trader.config import LIVE_CONFIRMATION
 from toss_trader.engine import KST, TradingEngine, _is_leveraged_or_inverse_etp
+from toss_trader.reconciliation import SyncStatus
 from toss_trader.state import PendingOrder, Position
 from toss_trader.strategy import (
     AdaptiveShadowEvaluation,
@@ -59,6 +61,12 @@ class FakeLiveClient(FakeClient):
 
     def buying_power(self) -> dict:
         return {"cashBuyingPower": "204644"}
+
+    def holdings(self) -> dict:
+        return {"holdings": []}
+
+    def pending_orders(self) -> list[dict]:
+        return []
 
     def list_orders(self, status: str) -> list[dict]:
         return self.open_orders
@@ -144,6 +152,10 @@ class EngineTests(unittest.TestCase):
             with self.managed_engine(config, FakeLiveClient()) as engine:
                 self.assertEqual(engine.state.initial_equity, Decimal("204644"))
                 self.assertEqual(engine.state.cash, Decimal("204644"))
+                self.assertEqual(
+                    engine.state.sync_status,
+                    SyncStatus.SUCCEEDED.value,
+                )
 
     def test_account_open_order_prevents_duplicate_entry_scan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -557,6 +569,59 @@ class EngineTests(unittest.TestCase):
                 self.assertTrue(record["continuation"]["paper_only"])
                 self.assertTrue(record["continuation"]["confirmed"])
                 self.assertEqual(record["continuation"]["confirmation_count"], 2)
+
+    def test_422_blocks_only_symbol_for_symbol_scoped_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.managed_engine(
+                settings(Path(temporary)), FakeClient()
+            ) as engine:
+                pending = PendingOrder(
+                    client_order_id="client-order",
+                    symbol="005930",
+                    side="BUY",
+                    quantity=1,
+                    created_at="2026-07-29T10:00:00+09:00",
+                    reference_price=Decimal("70000"),
+                )
+                engine.state.pending_order = pending
+                engine._handle_order_error(
+                    TossApiError(
+                        422,
+                        "price-out-of-range",
+                        "bad price",
+                        "req-1",
+                    ),
+                    pending,
+                )
+                self.assertIn("005930", engine.state.blocked_symbols)
+                self.assertFalse(engine.state.entries_halted)
+
+    def test_accepted_order_status_error_keeps_journal_and_halts_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.managed_engine(
+                settings(Path(temporary)), FakeClient()
+            ) as engine:
+                pending = PendingOrder(
+                    client_order_id="client-order",
+                    symbol="005930",
+                    side="BUY",
+                    quantity=1,
+                    created_at="2026-07-29T10:00:00+09:00",
+                    reference_price=Decimal("70000"),
+                    order_id="o1",
+                )
+                engine.state.pending_order = pending
+                engine._handle_order_error(
+                    TossApiError(
+                        503,
+                        "temporary-error",
+                        "unknown status",
+                    ),
+                    pending,
+                )
+                assert engine.state.pending_order is not None
+                self.assertEqual(engine.state.pending_order.order_id, "o1")
+                self.assertTrue(engine.state.entries_halted)
 
 
 if __name__ == "__main__":

@@ -51,7 +51,8 @@ class LiveBrokerTests(unittest.TestCase):
         self.assertEqual(execution.commission, Decimal("12"))
         self.assertEqual(execution.tax, Decimal("3"))
         assert client.created is not None
-        self.assertEqual(client.created["limit_price"], Decimal("85000"))
+        self.assertEqual(client.created["order_type"], "LIMIT")
+        self.assertEqual(client.created["price"], Decimal("85000"))
 
     def test_canceled_unfilled_order_is_rejected(self) -> None:
         client = FakeOrderClient(

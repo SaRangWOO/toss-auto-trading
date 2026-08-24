@@ -113,7 +113,8 @@ class LiveBroker:
             side=side,
             quantity=quantity,
             client_order_id=client_order_id,
-            limit_price=limit_price,
+            order_type="LIMIT" if limit_price is not None else "MARKET",
+            price=limit_price,
         )
         order_id = str(created["orderId"])
         if on_submitted is not None:
@@ -161,7 +162,6 @@ class LiveBroker:
         client_order_id: str | None = None,
         on_submitted: Callable[[str], None] | None = None,
     ) -> Execution:
-        # A marketable limit at the current best ask caps entry slippage.
         return self._execute(
             symbol,
             "BUY",
@@ -180,7 +180,6 @@ class LiveBroker:
         client_order_id: str | None = None,
         on_submitted: Callable[[str], None] | None = None,
     ) -> Execution:
-        # Risk exits prioritize execution certainty.
         return self._execute(
             symbol,
             "SELL",

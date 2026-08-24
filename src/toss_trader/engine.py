@@ -11,6 +11,7 @@ from pathlib import Path
 from .api import TossApiError, TossClient
 from .broker import Execution, LiveBroker, OrderNotFilled, PaperBroker
 from .config import Settings
+from .reconciliation import SyncStatus, parse_account_snapshot, reconcile_portfolio
 from .state import PendingOrder, PortfolioState, Position
 from .strategy import (
     MomentumSignal,
@@ -31,7 +32,6 @@ from .strategy import (
 
 
 KST = timezone(timedelta(hours=9))
-
 ACCOUNT_HALT_CODES = {
     "account-not-found",
     "account-restricted",
@@ -117,6 +117,36 @@ class TradingEngine:
         self._shadow_tracking_day: str | None = None
         self._shadow_tracking: list[dict] = []
         self._continuation_confirmations: dict[str, tuple[datetime, int]] = {}
+        if settings.mode == "live":
+            self._sync_live_account(today)
+
+    def _sync_live_account(self, trading_day: str) -> None:
+        self.state.sync_status = SyncStatus.IN_PROGRESS.value
+        self.state.sync_reason = None
+        self.state.save(self.settings.state_path)
+        try:
+            snapshot = parse_account_snapshot(
+                self.client.holdings(),
+                self.client.pending_orders(),
+                self.client.buying_power(),
+            )
+            reasons = reconcile_portfolio(
+                self.state, snapshot, trading_day=trading_day
+            )
+            if reasons:
+                self.logger.warning(
+                    "LIVE account reconciliation degraded: reasons=%s",
+                    ",".join(reasons),
+                )
+            else:
+                self.logger.info("LIVE account reconciliation succeeded")
+        except Exception as exc:
+            self.state.sync_status = SyncStatus.FAILED.value
+            self.state.sync_reason = f"sync_failed:{type(exc).__name__}"
+            self.state.entries_halted = True
+            self.state.halt_reason = "account_sync_failed"
+            self.logger.exception("LIVE account reconciliation failed")
+        self.state.save(self.settings.state_path)
 
     def _entry_window_open(self, now: datetime) -> bool:
         current = now.timetz()
@@ -684,6 +714,8 @@ class TradingEngine:
                     "ENTRY_SKIP leveraged_inverse_etp symbol=%s", symbol
                 )
                 continue
+            # KR orders require whole shares. Avoid expensive candidates that
+            # can never fit inside the configured per-trade ceiling.
             if Decimal(str(ranking["price"]["lastPrice"])) > self.settings.max_trade_krw:
                 continue
             if self.client.stock_warnings(symbol):
@@ -1024,6 +1056,23 @@ class TradingEngine:
         if not asks:
             return None
         best_ask, best_ask_volume = asks[0]
+        if self.settings.mode == "live":
+            limits = self.client.price_limits(signal.symbol)
+            lower = Decimal(str(limits.get("lowerLimitPrice", "0")))
+            upper = Decimal(str(limits.get("upperLimitPrice", "0")))
+            if (lower > 0 and best_ask < lower) or (
+                upper > 0 and best_ask > upper
+            ):
+                self.state.blocked_symbols[signal.symbol] = (
+                    "price_out_of_range_preflight"
+                )
+                self.state.save(self.settings.state_path)
+                self.logger.info(
+                    "ENTRY_SKIP price_out_of_range_preflight symbol=%s ask=%s",
+                    signal.symbol,
+                    best_ask,
+                )
+                return None
         baseline = signal.best_ask or signal.price
         if best_ask > baseline * (Decimal("1") + self.settings.max_entry_slippage_rate):
             self.logger.info(
@@ -1042,7 +1091,36 @@ class TradingEngine:
         equity: Decimal,
         now: datetime,
     ) -> bool:
-        quote = self._fresh_entry_quote(signal, now)
+        try:
+            quote = self._fresh_entry_quote(signal, now)
+        except TossApiError as exc:
+            self.state.last_error = f"preflight:{exc.code}:{exc}"
+            if self.settings.mode == "live":
+                if exc.code in ACCOUNT_HALT_CODES:
+                    self.state.entries_halted = True
+                    self.state.halt_reason = f"preflight:{exc.code}"
+                else:
+                    self.state.blocked_symbols[signal.symbol] = self.state.last_error
+                self.state.save(self.settings.state_path)
+            self.logger.warning(
+                "ENTRY_SKIP preflight_api_error symbol=%s code=%s status=%s",
+                signal.symbol,
+                exc.code,
+                exc.status,
+            )
+            return False
+        except Exception as exc:
+            if self.settings.mode == "live":
+                self.state.entries_halted = True
+                self.state.halt_reason = "preflight_failed"
+                self.state.last_error = f"preflight:{type(exc).__name__}"
+                self.state.save(self.settings.state_path)
+            self.logger.warning(
+                "ENTRY_SKIP preflight_error symbol=%s error=%s",
+                signal.symbol,
+                type(exc).__name__,
+            )
+            return False
         if quote is None:
             return False
         best_ask, best_ask_volume = quote
@@ -1054,6 +1132,18 @@ class TradingEngine:
             stop_rate=signal.risk_stop_rate,
         )
         quantity = min(quantity, best_ask_volume)
+        if self.settings.mode == "live":
+            quantity = min(
+                quantity,
+                int((cash * Decimal("0.95")) // best_ask),
+            )
+        else:
+            modeled_unit_cost = (
+                best_ask
+                * (Decimal("1") + self.settings.paper_slippage_bps / Decimal("10000"))
+                * (Decimal("1") + self.settings.paper_commission_rate)
+            )
+            quantity = min(quantity, int(cash // modeled_unit_cost))
         if quantity <= 0:
             self.logger.info("ENTRY_SKIP insufficient_budget symbol=%s", signal.symbol)
             return False
@@ -1126,6 +1216,19 @@ class TradingEngine:
             self.state.cash = cash
         if self.state.trading_day != now.date().isoformat() and not self.state.positions:
             self.state.roll_to_new_day(now.date().isoformat(), cash)
+
+        if self.settings.mode == "live" and self.state.sync_status != SyncStatus.SUCCEEDED.value:
+            self.logger.warning(
+                "신규 진입 중지: account_sync_status=%s reason=%s",
+                self.state.sync_status,
+                self.state.sync_reason,
+            )
+            for symbol in list(self.state.positions):
+                price = prices.get(symbol)
+                if price is not None and self._force_exit_due(now):
+                    self._sell(symbol, price, "account_sync_degraded_force_exit", now)
+            self.state.save(self.settings.state_path)
+            return
         self._daily_guard(cash, prices)
 
         if self.state.entries_halted:

@@ -1,6 +1,8 @@
 param(
-    [ValidateSet("check", "scan", "once", "run", "status", "report")]
-    [string]$Command = "status"
+    [ValidateSet("check", "scan", "once", "run", "status", "report", "verify-live-order")]
+    [string]$Command = "status",
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,14 +23,11 @@ $started = Get-Date -Format "yyyy-MM-dd HH:mm:ss K"
 Add-Content -LiteralPath $launcherLog -Value "[$started] START command=$Command"
 $previousErrorActionPreference = $ErrorActionPreference
 try {
-    # Windows PowerShell can promote native stderr to a terminating error even
-    # when it is redirected. Python logging uses stderr normally, so judge the
-    # child by its exit code instead.
     $ErrorActionPreference = "Continue"
     $instanceId = [Guid]::NewGuid().ToString("N")
     $stdoutPath = Join-Path $logDir "launcher.stdout.$instanceId.tmp"
     $stderrPath = Join-Path $logDir "launcher.stderr.$instanceId.tmp"
-    & $python -m toss_trader.cli $Command --project-root $projectRoot `
+    & $python -m toss_trader.cli $Command --project-root $projectRoot @Arguments `
         1> $stdoutPath 2> $stderrPath
     $exitCode = $LASTEXITCODE
     foreach ($outputPath in @($stdoutPath, $stderrPath)) {

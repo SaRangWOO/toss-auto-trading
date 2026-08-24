@@ -1,31 +1,42 @@
 # Architecture
 
-## 현재 구현
+## Current flow
 
 ```text
 Toss OpenAPI (REST polling)
-  -> TossClient: OAuth, throttle/retry, 시세·계좌·주문
-  -> TradingEngine.scan: 순위 -> 경고 -> 1분봉 -> 호가 -> 시장 지수
-  -> strategy: 모멘텀·거래량·가중 평균·spread 신호
-  -> engine risk: 시간·현금·비중·종목 수·일일 guard·stale data
-  -> PaperBroker 또는 LiveBroker
-       paper: 5bp 불리한 즉시 체결
-       live: 매수 limit, 매도 market, 조회·timeout·취소·부분 체결
-  -> 포지션: stop·take profit·trailing·15:10 청산·pending 복구
+  -> TossClient: OAuth, throttling/retry, market/account/order APIs
+  -> live startup reconciliation: holdings + pending orders + buying power
+  -> TradingEngine.scan: ranking -> warnings -> candles -> orderbook -> market regime
+  -> strategy: fixed safety -> liquidity -> breakout/adaptive proxy scores
+  -> engine risk: time, cash, exposure, daily guards, stale data
+  -> PaperBroker or LiveBroker
+       paper: adverse slippage + modeled commission/sell tax
+       live: marketable-limit buy, market risk exit, timeout/cancel/partial fill
+  -> position: hard/failure exits + paper-only 5m/10m review and profit protection
   -> state/*.json + logs/trader.log + report/YYYY/MM/YYYY-MM-DD.md
 ```
 
-CLI가 설정을 읽고 `once` 또는 `run_forever()`를 실행한다. 주문 전 pending
-journal을 저장하고 접수 callback에서 server order ID를 즉시 저장한다.
+CLI loads configuration and runs one cycle, the recurring runner, reporting, or
+the separately gated one-share live verification command. Orders are journaled
+before submission and the server order ID is saved by the submission callback.
 
-## 목표와 차이
+## Live account truth
 
-```text
-현재 시작: buying power + 로컬 상태 + pending 1건 복구
-목표 시작: 실제 잔고·보유·미체결 조회 -> 실제 계좌 우선 reconcile
-          -> 안전 상태가 확인된 뒤 scan/신호/risk/order 허용
-```
+At live startup, `TradingEngine` reads holdings, pending orders, and buying
+power. `reconciliation.py` applies account truth to `PortfolioState` before new
+entry scanning is allowed. Clean synchronization is `SUCCEEDED`; discrepancies
+are `DEGRADED`; query errors are `FAILED`. Any non-success state blocks new live
+entries while preserving existing risk exits.
 
-현재는 수동 보유 종목과 account open orders를 신규 진입에서 피하지만 실제
-계좌 상태로 내부 position을 완전히 재구성하지 않는다. 주문 정정, 연속
-거래손실 guard, 독립 총 노출 한도, paper/live 별도 로그도 목표 구조와 차이가 있다.
+## Paper experiments
+
+The continuation entry and 5m/10m position-management paths are evaluated only
+when `TRADING_MODE=paper`. They do not relax live startup reconciliation, fixed
+safety, liquidity, stale-data, position, daily-entry, or daily-loss guards.
+
+## Remaining gaps
+
+Toss response schemas, account permissions, actual fees/taxes, live forced exit,
+and the one-share verification flow still require an explicitly authorized real
+environment. Order amendment, independent total portfolio exposure, consecutive
+trade-loss guard, and remote alert/kill switch remain unimplemented.

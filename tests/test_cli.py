@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from toss_trader.cli import SingleInstanceLock
+from toss_trader.cli import SingleInstanceLock, build_parser
 
 
 class CliTests(unittest.TestCase):
@@ -35,6 +35,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("POWERSHELL_FATAL", script)
         self.assertIn("Out-File", script)
         self.assertIn("-Encoding utf8", script)
+        self.assertIn("@Arguments", script)
 
     def test_scheduled_task_restarts_and_has_report_fallback(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
@@ -56,6 +57,29 @@ class CliTests(unittest.TestCase):
         self.assertIn("$processRunning", script)
         self.assertIn("Start-ScheduledTask", script)
         self.assertIn("120", script)
+
+    def test_verify_live_order_arguments_are_available(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "verify-live-order",
+                "--symbol",
+                "090710",
+                "--quantity",
+                "1",
+                "--side",
+                "BUY",
+                "--order-type",
+                "LIMIT",
+                "--price-source",
+                "BEST_ASK",
+                "--no-retry",
+                "--confirm",
+                "LIVE-ORDER-090710-1",
+            ]
+        )
+        self.assertEqual(args.command, "verify-live-order")
+        self.assertEqual(args.symbol, "090710")
+        self.assertTrue(args.no_retry)
 
 
 if __name__ == "__main__":

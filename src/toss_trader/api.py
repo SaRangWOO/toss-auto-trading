@@ -70,6 +70,7 @@ class TossClient:
         self.timeout_seconds = timeout_seconds
         self._token: Token | None = None
         self._last_call: dict[str, float] = {}
+        self.retry_enabled = True
 
     @staticmethod
     def _decode_body(raw: bytes, content_encoding: str | None) -> str:
@@ -93,6 +94,18 @@ class TossClient:
         if wait > 0:
             time.sleep(wait)
         self._last_call[group] = time.monotonic()
+
+    @staticmethod
+    def _decode_body(raw: bytes, content_encoding: str | None) -> str:
+        encoding = (content_encoding or "").lower()
+        try:
+            if raw.startswith(b"\x1f\x8b") or "gzip" in encoding:
+                raw = gzip.decompress(raw)
+            elif "deflate" in encoding:
+                raw = zlib.decompress(raw)
+        except (EOFError, OSError, zlib.error):
+            pass
+        return raw.decode("utf-8", errors="replace")
 
     def issue_token(self, force: bool = False) -> str:
         if (
@@ -158,12 +171,12 @@ class TossClient:
             message = str(error_payload.get("message", raw[:300] or exc.reason))
             request_id = error_payload.get("requestId") or exc.headers.get("X-Request-Id")
             error_data = error_payload.get("data")
-            if exc.code == 401 and authenticated and retry == 0:
+            if self.retry_enabled and exc.code == 401 and authenticated and retry == 0:
                 self.issue_token(force=True)
                 return self._open(
                     request, authenticated=True, group=group, retry=retry + 1
                 )
-            if exc.code == 429 and retry < 3:
+            if self.retry_enabled and exc.code == 429 and retry < 3:
                 retry_after = float(exc.headers.get("Retry-After", 2**retry))
                 time.sleep(retry_after + random.uniform(0.05, 0.25))
                 return self._open(
@@ -172,7 +185,7 @@ class TossClient:
                     group=group,
                     retry=retry + 1,
                 )
-            if exc.code >= 500 and retry < 3:
+            if self.retry_enabled and exc.code >= 500 and retry < 3:
                 time.sleep((2**retry) + random.uniform(0.05, 0.25))
                 return self._open(
                     request,
@@ -188,7 +201,7 @@ class TossClient:
                 error_data if isinstance(error_data, dict) else None,
             ) from exc
         except urllib.error.URLError as exc:
-            if retry < 2:
+            if self.retry_enabled and retry < 2:
                 time.sleep(2**retry)
                 return self._open(
                     request,
@@ -372,7 +385,24 @@ class TossClient:
             },
             account=True,
         )
-        return result.get("orders", [])
+        return result if isinstance(result, list) else result.get("orders", [])
+
+    def price_limits(self, symbol: str) -> dict[str, Any]:
+        return self._request(
+            "GET", "/api/v1/price-limits", "MARKET_DATA", query={"symbol": symbol}
+        )
+
+    def pending_orders(self) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET",
+            "/api/v1/orders",
+            "ORDER_HISTORY",
+            query={"status": "OPEN"},
+            account=True,
+        )
+        if isinstance(result, list):
+            return result
+        return result.get("orders", result.get("pendingOrders", []))
 
     def create_order(
         self,
@@ -381,19 +411,20 @@ class TossClient:
         side: str,
         quantity: int,
         client_order_id: str,
-        limit_price: Decimal | None = None,
+        order_type: str = "MARKET",
+        price: Decimal | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "clientOrderId": client_order_id,
             "symbol": symbol,
             "side": side,
-            "orderType": "LIMIT" if limit_price is not None else "MARKET",
-            "timeInForce": "DAY",
+            "orderType": order_type,
             "quantity": str(quantity),
-            "confirmHighValueOrder": False,
         }
-        if limit_price is not None:
-            body["price"] = format(limit_price, "f")
+        if order_type == "LIMIT":
+            if price is None or price <= 0:
+                raise ValueError("LIMIT 주문에는 양수 price가 필요합니다.")
+            body["price"] = format(price, "f")
         return self._request(
             "POST",
             "/api/v1/orders",

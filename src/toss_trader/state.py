@@ -93,7 +93,9 @@ class PendingOrder:
             side=str(value["side"]),
             quantity=int(value["quantity"]),
             created_at=str(value["created_at"]),
-            reference_price=Decimal(str(value["reference_price"])),
+            reference_price=Decimal(
+                str(value.get("reference_price", value.get("price", "0")))
+            ),
             order_id=value.get("order_id"),
             reason=value.get("reason"),
         )
@@ -121,6 +123,10 @@ class PortfolioState:
     daily_entries: int = 0
     entries_halted: bool = False
     halt_reason: str | None = None
+    sync_status: str = "NOT_STARTED"
+    sync_reason: str | None = None
+    pending_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
+    recovery_required: list[str] = field(default_factory=list)
     blocked_symbols: dict[str, str] = field(default_factory=dict)
     pending_order: PendingOrder | None = None
     consecutive_errors: int = 0
@@ -160,6 +166,12 @@ class PortfolioState:
             daily_entries=int(raw.get("daily_entries", 0)),
             entries_halted=bool(raw.get("entries_halted", False)),
             halt_reason=raw.get("halt_reason"),
+            sync_status=str(raw.get("sync_status", "NOT_STARTED")),
+            sync_reason=raw.get("sync_reason"),
+            pending_orders=dict(raw.get("pending_orders", {})),
+            recovery_required=[
+                str(item) for item in raw.get("recovery_required", [])
+            ],
             blocked_symbols={
                 str(symbol): str(reason)
                 for symbol, reason in raw.get("blocked_symbols", {}).items()
@@ -187,6 +199,10 @@ class PortfolioState:
             "daily_entries": self.daily_entries,
             "entries_halted": self.entries_halted,
             "halt_reason": self.halt_reason,
+            "sync_status": self.sync_status,
+            "sync_reason": self.sync_reason,
+            "pending_orders": self.pending_orders,
+            "recovery_required": self.recovery_required,
             "blocked_symbols": self.blocked_symbols,
             "pending_order": (
                 self.pending_order.to_dict() if self.pending_order else None

@@ -57,7 +57,8 @@ class ApiTests(unittest.TestCase):
             side="BUY",
             quantity=2,
             client_order_id="test-order-id",
-            limit_price=Decimal("85000"),
+            order_type="LIMIT",
+            price=Decimal("85000"),
         )
         assert client.request is not None
         self.assertEqual(result["orderId"], "order-test")
@@ -71,12 +72,21 @@ class ApiTests(unittest.TestCase):
                 "symbol": "005930",
                 "side": "BUY",
                 "orderType": "LIMIT",
-                "timeInForce": "DAY",
                 "quantity": "2",
-                "confirmHighValueOrder": False,
                 "price": "85000",
             },
         )
+
+    def test_limit_order_requires_positive_price(self) -> None:
+        client = RecordingClient()
+        with self.assertRaises(ValueError):
+            client.create_order(
+                symbol="005930",
+                side="BUY",
+                quantity=1,
+                client_order_id="test-order-id",
+                order_type="LIMIT",
+            )
 
     def test_market_order_omits_price(self) -> None:
         client = RecordingClient()
