@@ -1,62 +1,147 @@
-# toss-auto-trading
+# Toss Auto Trading
 
-Toss OpenAPI로 국내 주식의 단기 모멘텀 후보를 찾고, 사전에 정한 자금·손실
-한도 안에서 paper 또는 live 주문을 자동 실행하는 Python 프로젝트입니다.
-live가 사전 승인된 뒤에는 전략 진입과 손절·익절·시간 청산을 주문별 추가
-승인 없이 수행합니다. 수익을 보장하지 않으며 실거래 손실이 발생할 수 있습니다.
+> Toss Securities OpenAPI 기반의 국내 주식 단기 모멘텀 자동매매 시스템
+> A safety-first, evidence-driven momentum trading system for the Korean stock market.
 
-## 현재 운영 방식
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![Mode](https://img.shields.io/badge/default-paper%20trading-2E8B57)
+![Tests](https://img.shields.io/badge/tests-offline%20unittest-4C1)
+![License](https://img.shields.io/badge/license-not%20specified-lightgrey)
 
-- 거래대금 상위 종목을 REST polling으로 조회합니다.
-- 당일 1분봉의 5분·15분 모멘텀, 거래량 급증, 최근 20개 봉의
-  종가×거래량 가중 평균, 스프레드와 시장 지수 상태를 검사합니다.
-- 기본 진입 시간은 `09:05~10:30`, `13:30~14:45`입니다.
-- 손절, 익절, 트레일링 스톱과 15:10 강제 청산을 적용합니다.
-- 보유 종목은 신규 후보에서 제외하므로 손실 포지션 물타기를 하지 않습니다.
-- 주문 전 pending journal을 저장하고 접수 ID, 부분 체결, 취소와 재시작 복구를 처리합니다.
+단순히 매수·매도 신호를 만드는 데 그치지 않고, **잘못된 주문을 내지 않는 구조**와
+**실험 결과를 재현할 수 있는 관측 체계**에 초점을 둔 개인 프로젝트입니다. 후보 탐색,
+다단계 필터링, paper/live broker 분리, 주문 복구, 일일 리스크 제한, 운영 보고서까지
+자동매매의 전체 실행 흐름을 Python 표준 라이브러리만으로 구현했습니다.
 
-실제 수치는 `.env.example`의 기본값이며 로컬 `.env`가 이를 덮어쓸 수 있습니다.
+현재 기본 운영 모드는 `paper`입니다. 실거래 경로는 계좌 상태 동기화와 이중 잠금을
+통과해야 하며, paper에서 검증 중인 전략은 live에 자동 반영되지 않습니다.
 
-## 프로젝트 구조
+## 프로젝트 한눈에 보기
 
-```text
-src/toss_trader/
-  api.py          Toss 인증·시세·계좌·주문 REST client
-  config.py       .env 로딩, 기본값, live 이중 잠금
-  strategy.py     진입 신호, 수량, 청산 조건
-  broker.py       paper 체결과 live 주문 추적
-  engine.py       스캔, 리스크, 주문, 포지션, 복구
-  state.py        로컬 JSON 상태
-  reporting.py    날짜별 운영 보고서
-  cli.py          명령 진입점과 단일 인스턴스 잠금
-tests/            네트워크 없는 단위 테스트
-scripts/          설정·실행·예약 작업·비상 정지
-docs/             실제 구현 상태와 설계 문서
-report/           Git에 보존하는 소형 날짜별 보고서
+| 구분 | 내용 |
+| --- | --- |
+| 대상 | 국내 주식 단기 모멘텀·돌파 후보 |
+| 데이터/주문 | Toss Securities OpenAPI REST polling |
+| 핵심 흐름 | 종목 랭킹 → 안전·유동성 필터 → 시장 국면 → 돌파 → 적응형 점수 → 주문 |
+| 리스크 관리 | 주문 금액·보유 수·일일 진입·일일 손실 제한, stale data 차단, 강제 청산 |
+| 안정성 | single-instance lock, pending journal, 부분 체결·취소·재시작 복구, 계좌 reconciliation |
+| 검증 | 네트워크 없는 `unittest`, paper 체결, filter funnel·shadow 사후 추적 |
+| 운영 환경 | Windows, Python 3.11+, PowerShell, Windows Task Scheduler |
+
+## 전략 파이프라인
+
+```mermaid
+flowchart LR
+    A[고정 안전 필터] --> B[유동성<br/>거래대금 500억+]
+    B --> C[시장 국면]
+    C --> D[시초 박스<br/>돌파 후보]
+    D --> E[시간대 적응형<br/>Volume Score]
+    E --> F[VWAP · 호가 ·<br/>체결 Proxy Score]
+    F --> G[최종 진입 점수]
+    G --> H{운영 모드}
+    H -->|paper| I[비용·슬리피지 모사]
+    H -->|live + 이중 잠금| J[계좌 동기화 후 주문]
 ```
 
-로컬 `.env`, `.venv/`, `logs/`, `state/`는 Git에서 제외됩니다.
+기본 진입 시간은 오전 `10:00~11:30`, 오후 `14:50~15:30`이며 `15:35`에
+강제 청산합니다. 오전에는 09:00~09:30의 고가·저가로 만든 시초 박스를 기준으로
+돌파와 거래량을 확인합니다. 기관 순매수 원천 데이터가 제공되지 않는 제약은 VWAP,
+호가 불균형, 체결 강도성 지표를 조합한 proxy score로 보완합니다.
 
-## 요구 환경과 설치
+고정 안전장치를 통과한 뒤에도 다음 조건을 순차 적용합니다.
+
+- 레버리지·인버스 상품 제외, 시세 신선도와 스프레드 검증
+- 당일 거래대금 500억 원 이상과 가격 변동 범위 확인
+- 시장 지수의 5분·15분 흐름으로 하락 국면 필터링
+- 시초 박스 돌파, 적응형 거래량, VWAP, 호가, 체결 proxy 점수화
+- 현금·포지션·일일 진입 횟수·일일 손익 한도와 최종 신호 재검증
+
+## 설계에서 중요하게 다룬 문제
+
+### 1. paper와 live의 격리
+
+`PaperBroker`와 `LiveBroker`를 분리했습니다. paper는 불리한 슬리피지와 수수료·세금
+모델을 반영하지만 외부 주문을 만들지 않습니다. 실험 중인 추세 지속 보조 진입과
+5분·10분 포지션 재평가는 paper에서만 실행됩니다.
+
+### 2. 계좌 상태를 진실의 원천으로 사용
+
+live 시작 시 보유 종목, 미체결 주문, 주문 가능 금액을 조회해 로컬 상태와 대조합니다.
+동기화가 `SUCCEEDED`가 아니면 신규 진입을 차단하되, 기존 포지션의 위험 청산 경로는
+유지합니다.
+
+### 3. 주문 장애와 재시작 복구
+
+주문 제출 전에 pending journal을 기록하고, 서버 주문 ID·부분 체결·timeout 취소를
+추적합니다. 프로세스가 재시작되면 미완료 주문을 복구 대상으로 읽어 중복 주문 위험을
+줄입니다.
+
+### 4. 결과보다 근거를 남기는 실험
+
+각 후보가 어느 필터에서 탈락했는지 `filter_funnel`에 기록하고, 진입하지 않은 후보도
+5/10/15/30분 수익률과 MFE/MAE를 `shadow_tracking`으로 추적합니다. 전략 변경은
+단일 사례가 아니라 서로 다른 episode의 사후성과를 비교한 뒤 paper에 한정해 적용합니다.
+
+## 시스템 구조
+
+```mermaid
+flowchart TD
+    API[Toss OpenAPI] --> CLIENT[TossClient<br/>OAuth · retry · throttling]
+    CLIENT --> ENGINE[TradingEngine]
+    ENGINE --> STRATEGY[Strategy<br/>filters · scores · exits]
+    ENGINE --> RISK[Risk guards<br/>cash · exposure · daily limits]
+    ENGINE --> BROKER{Broker}
+    BROKER --> PAPER[PaperBroker]
+    BROKER --> LIVE[LiveBroker]
+    ENGINE --> STATE[(Local state)]
+    ENGINE --> OBS[Logs · reports<br/>funnel · shadow tracking]
+    LIVE --> RECON[Account reconciliation]
+    RECON --> ENGINE
+```
+
+## 디렉터리 구조
+
+```text
+auto-trading/
+├─ src/toss_trader/
+│  ├─ api.py              # OAuth, 시세·계좌·주문 REST client
+│  ├─ broker.py           # paper 체결과 live 주문 수명주기
+│  ├─ config.py           # 환경 설정, 검증, live 이중 잠금
+│  ├─ engine.py           # 스캔, 리스크, 주문, 포지션, 복구 orchestration
+│  ├─ reconciliation.py   # live 계좌와 로컬 상태 동기화
+│  ├─ reporting.py        # 날짜별 운영 보고서
+│  ├─ state.py            # 포트폴리오·주문 상태 저장
+│  ├─ strategy.py         # 진입 점수, 수량, 청산·포지션 재평가
+│  └─ cli.py              # CLI와 single-instance runner
+├─ tests/                 # 네트워크를 사용하지 않는 unittest
+├─ scripts/               # 설치, 실행, 예약 작업, watchdog, 비상 정지
+├─ docs/                  # 아키텍처, 설계 결정, 실험·운영 검토
+├─ report/                # Git에 보존하는 소형 날짜별 운영 보고서
+├─ reports/               # 로컬 상세 진단 데이터 (Git 제외)
+├─ logs/                  # 로컬 runner·trading 로그 (Git 제외)
+├─ state/                 # 로컬 계좌·주문 상태 (Git 제외)
+├─ .env.example           # 비밀값 없는 설정 예시
+└─ pyproject.toml
+```
+
+로컬 `.env`, `.venv/`, `logs/`, `state/`, `reports/`는 Git에서 제외됩니다.
+
+## 빠른 시작
+
+### 요구 환경
 
 - Windows PowerShell
 - Python 3.11 이상
-- 외부 런타임 패키지 없음
+- Toss Securities OpenAPI 사용 권한
+
+런타임 외부 패키지는 없습니다.
 
 ```powershell
 .\scripts\setup.cmd
-```
-
-스크립트는 `.venv`를 만들고 Python 버전을 확인합니다. 실행 스크립트가
-`src`를 `PYTHONPATH`에 지정하므로 별도 package 설치는 필요하지 않습니다.
-
-## 환경 설정
-
-```powershell
 Copy-Item .env.example .env
 ```
 
-`.env`에 다음 값을 직접 입력합니다. 실제 값은 채팅이나 Git에 올리지 않습니다.
+`.env`에 발급받은 값을 로컬에서만 입력합니다.
 
 ```dotenv
 TOSS_CLIENT_ID=
@@ -66,46 +151,22 @@ TRADING_MODE=paper
 LIVE_TRADING_CONFIRM=
 ```
 
-live 전에는 Toss WTS의 허용 IP, 국내주식 사전 동의·위험 고지, 투자자 유형,
-거래소 통합(SOR)과 계좌 주문 가능 상태도 별도로 확인해야 합니다.
-
-## paper 모드
-
-```dotenv
-TRADING_MODE=paper
-LIVE_TRADING_CONFIRM=
-```
+실행 명령은 다음과 같습니다.
 
 ```powershell
-.\scripts\run.cmd check
-.\scripts\run.cmd scan
-.\scripts\run.cmd once
-.\scripts\run.cmd run
+.\scripts\run.cmd status  # 로컬 상태 확인
+.\scripts\run.cmd check   # API·설정 점검
+.\scripts\run.cmd scan    # 후보 스캔
+.\scripts\run.cmd once    # 1회 전략 사이클
+.\scripts\run.cmd run     # 장중 반복 runner
+.\scripts\run.cmd report  # 일일 보고서 생성
+.\scripts\stop.cmd        # 예약 작업·runner 비상 정지
 ```
 
-paper 주문은 기본 5bp의 불리한 슬리피지와 설정 가능한 매수·매도 수수료,
-매도세 가정을 적용해 즉시 체결로 모사합니다. 기본 비용률은 실제 Toss 계좌의
-확정 요율이 아니라 전략을 보수적으로 평가하기 위한 모델값입니다. 부분 체결,
-호가 잔량에 따른 충격과 주문 지연은 아직 완전히 재현하지 않습니다.
-paper 체결은 상태 파일에도 주문 형태로 저장되어 날짜별 보고서의 왕복 거래와
-체결 기준 손익 계산에 사용됩니다.
+`check`, `scan`, `report`도 Toss API를 호출할 수 있습니다. `once`, `run`은 live
+설정에서 실제 주문을 만들 수 있으므로 연결 테스트 용도로 실행하면 안 됩니다.
 
-paper 모드에는 2026-08-22 주간 검토에서 추가한 보수적인 오전 추세 지속
-보조 진입 실험이 포함됩니다. 최근 10분 안의 시초 박스 돌파, 박스 위 2개 봉
-유지, 높은 적응형 점수와 거래량·호가·체결 proxy, 제한된 VWAP/돌파 이격이
-2회 연속 확인되어야 하며 당일 첫 진입에만 적용됩니다. 기존 안전·유동성·시장
-국면·스프레드·리스크·최종 신호 필터는 그대로 적용되고 live에서는 이 경로를
-평가하지 않습니다. 설정값은 `.env.example`의 `PAPER_CONTINUATION_*` 항목에서
-확인할 수 있습니다.
-
-paper 보유 포지션은 진입 후 5분과 10분에 VWAP, 최근 거래량 유지율과 체결
-압력 proxy를 다시 평가합니다. 약한 신호가 겹치거나 10분까지 추세 진전이
-없으면 조기 청산하고, 강한 추세가 확인되면 고정 익절 대신 최대 수익 대비
-되돌림 한도로 관리합니다. 이 경로와 비용 모델은 이번 paper 관찰을 위한
-실험이며 live 진입·청산 로직에는 적용되지 않습니다. 자세한 기준과 승격
-조건은 `docs/PAPER_POSITION_MANAGEMENT_2026-08-24.md`에 기록합니다.
-
-## live 모드
+## 안전한 live 활성화
 
 다음 두 설정이 동시에 정확해야 live 주문 경로가 열립니다.
 
@@ -114,46 +175,9 @@ TRADING_MODE=live
 LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY
 ```
 
-```powershell
-.\scripts\run.cmd once
-.\scripts\run.cmd run
-```
-
-`once`와 `run`은 전략·리스크 조건을 충족하면 실제 주문을 자동 제출할 수
-있습니다. 단순 연결 확인이나 테스트 목적으로 실행하지 마세요. 전략과 무관한
-임의 주문은 금지합니다. 평일 09:04 예약 작업은 다음으로 등록합니다.
-
-```powershell
-.\scripts\install-task.cmd
-```
-
-## 상태, 주문과 체결 확인
-
-```powershell
-.\scripts\run.cmd status
-.\scripts\run.cmd report
-```
-
-- 상태: `state/paper_portfolio.json` 또는 `state/live_portfolio.json`
-- 로그: `logs/trader.log` (`mode=paper|live`가 각 거래 이벤트에 포함됨)
-- 날짜별 보고서: `report/YYYY/MM/YYYY-MM-DD.md`
-- shadow 후보 사후성과: `reports/shadow_tracking/YYYY-MM-DD.json`
-- paper 5분·10분 보유 점검: `reports/position_reviews/YYYY-MM-DD.jsonl`
-- 실제 접수·미체결·체결·취소의 최종 근거: Toss WTS의 해당 계좌 주문 내역
-
-`status`는 로컬 상태만 읽습니다. live의 `report`는 계좌와 주문 API를
-조회할 수 있습니다. 내부 상태와 Toss 계좌가 다르면 현재 코드는 자동으로
-전체 상태를 교정하지 못하므로 실행을 중지하고 확인해야 합니다.
-
-## 비상 정지
-
-```powershell
-.\scripts\stop.cmd
-```
-
-예약 작업을 중지하고 이 프로젝트의 `toss_trader.cli run` Python 프로세스를
-강제 종료합니다. 강제 종료 시 진행 중 주문은 서버에 남을 수 있으므로 Toss
-WTS에서 미체결 주문과 보유 종목을 즉시 확인해야 합니다.
+설정만으로 충분하지 않습니다. WTS 허용 IP, 국내주식 사전 동의, 주문 가능 상태와
+live startup reconciliation도 모두 정상이어야 신규 진입이 허용됩니다. 전략과 무관한
+테스트 주문은 코드와 운영 원칙상 허용하지 않습니다.
 
 ## 테스트
 
@@ -161,27 +185,37 @@ WTS에서 미체결 주문과 보유 종목을 즉시 확인해야 합니다.
 $env:PYTHONPATH = "$PWD\src"
 .\.venv\Scripts\python.exe -m compileall -q src tests
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+git diff --check
 ```
 
-단위 테스트는 실제 Toss API와 실제 주문을 호출하지 않습니다.
+단위 테스트는 fake client를 사용하며 실제 Toss API와 실제 주문을 호출하지 않습니다.
 
-## 구현 상태와 제한
+## 검토 자료
 
-OAuth, 계좌·시세 조회, 후보 스캔, paper 체결, live 주문 제출·조회·취소,
-부분 체결 반영, pending journal, 일일 손실/수익 잠금, 단일 인스턴스와 비상
-정지가 구현되어 있습니다. 자세한 검증 상태는 `docs/PROJECT_STATE.md`를
-참조하세요.
+- [포트폴리오 소개와 설계 과정](docs/PORTFOLIO_OVERVIEW.md)
+- [현재 아키텍처](docs/ARCHITECTURE.md)
+- [구현 및 안전 상태](docs/PROJECT_STATE.md)
+- [전략·운영 설계 결정](docs/DECISIONS.md)
+- [기관 수급 proxy 설계](docs/INSTITUTIONAL_PROXY.md)
+- [주간 진입 전략 검토](docs/WEEKLY_ENTRY_REVIEW_2026-08-22.md)
+- [paper 포지션 관리 실험](docs/PAPER_POSITION_MANAGEMENT_2026-08-24.md)
+- [날짜별 운영 리포트](report/README.md)
 
-주요 제한은 다음과 같습니다.
+대표 주간 검토에서는 6개의 서로 다른 shadow episode와 2건의 paper 왕복 거래를
+분석해, 엄격한 돌파 필터를 전면 완화하지 않고 고품질 추세 지속 경로만 paper에
+추가했습니다. 이 결과는 전략 검증 방식의 예시이며 수익성을 입증하는 표본은 아닙니다.
 
-- 재시작 시 실제 보유 종목·미체결 주문과 내부 포지션의 완전한 동기화가 없습니다.
-- 미체결 주문은 취소하지만 주문 정정은 구현하지 않았습니다.
-- 연속 시스템 오류 제한은 있으나 연속 거래손실 제한은 없습니다.
-- 종목별 비중과 보유 종목 수 제한은 있으나 별도의 전체 포트폴리오 한도는 없습니다.
-- paper/live가 같은 로그 파일을 사용하고 paper 체결 모사는 단순합니다.
-- live 체결·수수료·세금·장 마감 복구는 실제 계좌 환경에서 재검증이 필요합니다.
+## 현재 한계와 다음 과제
 
-## 공식 문서
+- paper 체결은 호가 잔량 충격, 네트워크 지연, 부분 체결을 완전히 재현하지 않습니다.
+- 실제 API schema, 수수료·세금, 장 마감 강제청산은 승인된 live 환경에서 재검증이 필요합니다.
+- 주문 정정, 연속 거래손실 guard, 독립적인 전체 노출 한도, 원격 알림은 미구현입니다.
+- paper 실험을 live로 승격하기에는 서로 다른 시장 국면의 관측 표본이 더 필요합니다.
 
-- [Toss Securities OpenAPI 가이드](https://developers.tossinvest.com/docs)
-- [OpenAPI 명세](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)
+## 보안과 면책
+
+인증정보·계좌 식별값은 `.env` 또는 OS 자격증명 저장소에서만 관리하며 저장소와
+운영 보고서에 기록하지 않습니다. 이 프로젝트는 학습·포트폴리오·개인 검증 목적이며,
+투자 권유가 아닙니다. 수익을 보장하지 않고 실제 거래에는 원금 손실 위험이 있습니다.
+
+공식 API 문서: [Toss Securities OpenAPI 가이드](https://developers.tossinvest.com/docs)
