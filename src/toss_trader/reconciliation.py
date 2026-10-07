@@ -97,6 +97,7 @@ def reconcile_portfolio(
     *,
     trading_day: str,
     now: datetime | None = None,
+    manual_holding_symbols: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Apply broker truth to local state and return auditable discrepancy reasons."""
     reasons: list[str] = []
@@ -127,6 +128,8 @@ def reconcile_portfolio(
 
     for symbol, actual in snapshot.positions.items():
         if symbol in state.positions:
+            continue
+        if symbol in manual_holding_symbols:
             continue
         reasons.append(f"account_only_position:{symbol}")
         price = actual.average_price if actual.average_price > 0 else Decimal("0")

@@ -52,6 +52,18 @@ def _windows(value: str) -> tuple[tuple[str, str], ...]:
     return tuple(windows)
 
 
+def _symbols(name: str) -> frozenset[str]:
+    symbols = frozenset(
+        item.strip().upper()
+        for item in os.getenv(name, "").split(",")
+        if item.strip()
+    )
+    invalid = [symbol for symbol in symbols if len(symbol) != 6 or not symbol.isalnum()]
+    if invalid:
+        raise ValueError(f"{name}에는 6자리 종목코드만 입력할 수 있습니다.")
+    return symbols
+
+
 @dataclass(frozen=True)
 class Settings:
     client_id: str
@@ -91,12 +103,17 @@ class Settings:
     adaptive_shadow_min_score: Decimal
     breakout_confirmation_candles: int
     paper_continuation_entry_enabled: bool
+    live_continuation_entry_enabled: bool
     continuation_confirmation_evaluations: int
     continuation_breakout_max_age_minutes: int
     continuation_min_entry_score: Decimal
     continuation_min_volume_score: Decimal
     continuation_min_trade_pressure_score: Decimal
     continuation_min_orderbook_score: Decimal
+    continuation_min_proxy_supports: int
+    continuation_signal_min_volume_surge: Decimal
+    continuation_signal_min_institutional_proxy_score: int
+    continuation_min_breakout_distance: Decimal
     continuation_max_vwap_distance: Decimal
     continuation_max_breakout_distance: Decimal
     failure_exit_enabled: bool
@@ -134,6 +151,9 @@ class Settings:
     min_market_5m_rate: Decimal
     min_market_15m_rate: Decimal
     project_root: Path
+    manual_holding_symbols: frozenset[str] = frozenset()
+    experiment_variant: str = "baseline"
+    experiment_version: int = 1
 
     @classmethod
     def from_project(cls, project_root: Path | None = None) -> "Settings":
@@ -192,6 +212,9 @@ class Settings:
             paper_continuation_entry_enabled=_boolean(
                 "PAPER_CONTINUATION_ENTRY_ENABLED", True
             ),
+            live_continuation_entry_enabled=_boolean(
+                "LIVE_CONTINUATION_ENTRY_ENABLED", False
+            ),
             continuation_confirmation_evaluations=_integer(
                 "CONTINUATION_CONFIRMATION_EVALUATIONS", 2
             ),
@@ -209,6 +232,18 @@ class Settings:
             ),
             continuation_min_orderbook_score=_decimal(
                 "CONTINUATION_MIN_ORDERBOOK_SCORE", "0.50"
+            ),
+            continuation_min_proxy_supports=_integer(
+                "CONTINUATION_MIN_PROXY_SUPPORTS", 1
+            ),
+            continuation_signal_min_volume_surge=_decimal(
+                "CONTINUATION_SIGNAL_MIN_VOLUME_SURGE", "1.00"
+            ),
+            continuation_signal_min_institutional_proxy_score=_integer(
+                "CONTINUATION_SIGNAL_MIN_INSTITUTIONAL_PROXY_SCORE", 2
+            ),
+            continuation_min_breakout_distance=_decimal(
+                "CONTINUATION_MIN_BREAKOUT_DISTANCE", "0.000001"
             ),
             continuation_max_vwap_distance=_decimal(
                 "CONTINUATION_MAX_VWAP_DISTANCE", "0.05"
@@ -283,6 +318,7 @@ class Settings:
             min_market_5m_rate=_decimal("MIN_MARKET_5M_RATE", "-0.005"),
             min_market_15m_rate=_decimal("MIN_MARKET_15M_RATE", "-0.010"),
             project_root=root,
+            manual_holding_symbols=_symbols("LIVE_MANUAL_HOLDING_SYMBOLS"),
         )
         settings.validate()
         return settings
@@ -330,8 +366,22 @@ class Settings:
         ):
             if not Decimal("0") <= value <= Decimal("1"):
                 raise ValueError(f"{name} must be in [0, 1]")
+        if not 1 <= self.continuation_min_proxy_supports <= 2:
+            raise ValueError("CONTINUATION_MIN_PROXY_SUPPORTS must be 1 or 2")
+        if not Decimal("0.5") <= self.continuation_signal_min_volume_surge <= self.min_volume_surge:
+            raise ValueError(
+                "CONTINUATION_SIGNAL_MIN_VOLUME_SURGE must be between 0.5 and MIN_VOLUME_SURGE"
+            )
+        if not 1 <= self.continuation_signal_min_institutional_proxy_score <= self.min_institutional_proxy_score:
+            raise ValueError(
+                "CONTINUATION_SIGNAL_MIN_INSTITUTIONAL_PROXY_SCORE must not exceed MIN_INSTITUTIONAL_PROXY_SCORE"
+            )
         if not Decimal("0") < self.continuation_max_vwap_distance <= Decimal("0.10"):
             raise ValueError("CONTINUATION_MAX_VWAP_DISTANCE must be in (0, 0.10]")
+        if not Decimal("0") < self.continuation_min_breakout_distance < self.continuation_max_breakout_distance:
+            raise ValueError(
+                "CONTINUATION_MIN_BREAKOUT_DISTANCE must be positive and below the maximum"
+            )
         if not Decimal("0") < self.continuation_max_breakout_distance <= Decimal("0.05"):
             raise ValueError(
                 "CONTINUATION_MAX_BREAKOUT_DISTANCE must be in (0, 0.05]"

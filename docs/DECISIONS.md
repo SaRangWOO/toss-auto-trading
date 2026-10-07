@@ -15,8 +15,12 @@
 | 주문 전 pending과 client ID를 저장 | 반영 | `_new_pending()` |
 | 계좌 오류는 전체 halt, 종목 오류는 symbol block | 부분 반영 | 알려진 error code만 분류 |
 | account open order와 중복 process 차단 | 반영 | `list_orders("OPEN")`, lock |
-| 실제 계좌 상태가 내부 상태보다 우선 | 부분 반영 | full startup sync 미구현 |
+| 실제 계좌 상태가 내부 상태보다 우선 | 반영 | live startup reconciliation |
+| 명시한 기존 수동 보유는 봇이 관리·청산하지 않음 | 반영 | `LIVE_MANUAL_HOLDING_SYMBOLS` |
 | 미체결은 자동 정정 또는 취소 판단 | 부분 반영 | timeout 취소만 구현 |
 | 연속 손실 제한 | 미반영 | system exception counter만 존재 |
 | paper/live 로그 분리 | 부분 반영 | 동일 파일, event에 mode 기록 |
 | Git 게시 전 test·secret 검증 | 운영 규칙 | `AGENTS.md` |
+| 외부 분봉은 완료 봉 후 다음 봉 시가로 replay | 반영 | `research.py` look-ahead 차단 |
+| 외부 수급 provider는 읽기 전용·기본 비활성 | 반영 | `kis_data.py`, `KIS_DATA_ENABLED=false` |
+| 외부 연구 결과의 live 자동 승격 금지 | 반영 | paper candidate만 산출 |

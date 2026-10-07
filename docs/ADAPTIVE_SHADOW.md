@@ -28,22 +28,32 @@ breakout failure exit requires two distinct completed candles and corroborating
 selling pressure, while the hard stop remains immediate even during the minimum
 hold period.
 
-## Paper-only continuation experiment
+## Confirmed continuation entry path
 
-Following the 2026-08-22 weekly review, paper mode has a conservative auxiliary
-morning path for a recent opening-range breakout that remains strong after the
-exact crossover candle. It requires two completed candles above the opening
-range, a breakout no older than ten minutes, two persistent evaluations, entry
-score at least 0.85, volume score at least 0.80, trade-pressure score at least
-0.55, order-book score at least 0.50, a positive VWAP distance no greater than
-5%, and breakout extension no greater than 1.5%.
+The continuation path is a conservative auxiliary morning path for a recent
+opening-range breakout that remains strong after the exact crossover candle.
+It requires two completed candles above the opening range, a breakout no older
+than ten minutes, two persistent evaluations, positive VWAP distance within its
+configured limit, and a bounded breakout extension. The minimum breakout
+distance prevents shallow moves from being promoted merely because they held
+above the range briefly.
 
-This auxiliary path is limited to the first daily entry and still passes all
-existing fixed safety, liquidity, market-regime, spread, risk, and final signal
-checks. It is never evaluated in live mode. Funnel records include a
+This path is limited to the first daily entry and still passes all existing
+fixed safety, liquidity, market-regime, spread, risk, and final momentum-signal
+checks. During a paper-only trial, the final signal can use the adaptive
+five-minute volume threshold: volume is mandatory, while either trade pressure
+or order-book support must corroborate it. This avoids treating either noisy
+snapshot as a standalone veto. Live keeps
+the ordinary final-signal thresholds unless a separately reviewed deployment
+changes them. The path is disabled for live orders by default and requires the explicit
+`LIVE_CONTINUATION_ENTRY_ENABLED=true` setting. Funnel records include a
 `continuation` diagnostic object so rejected cases can be distinguished by
 breakout age, opening-range hold/retest, VWAP distance, extension, confirmation
 count, and explicit rejection reasons.
+
+The live setting is intended only for reviewed deployments. It is not a bypass
+of the final signal filter: candidates that do not meet the normal liquidity,
+spread, momentum, VWAP and institutional-proxy requirements remain ineligible.
 
 ## Paper-only position management experiment
 

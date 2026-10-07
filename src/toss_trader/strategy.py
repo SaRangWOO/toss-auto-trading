@@ -78,7 +78,10 @@ def analyze_candidate(
     orderbook: dict[str, Any],
     settings: Settings,
     as_of: datetime | None = None,
+    diagnostics: dict | None = None,
 ) -> MomentumSignal | None:
+    if diagnostics is not None:
+        diagnostics.update(reasons=["incomplete_or_stale_data"], metrics={})
     if len(candles) < 16:
         return None
     ordered_all = sorted(candles, key=lambda item: item["timestamp"])
@@ -195,6 +198,23 @@ def analyze_candidate(
         min(atr_rate * settings.atr_stop_multiplier, settings.max_stop_loss_rate),
     )
 
+    checks = {
+        "liquidity": trading_amount >= settings.min_trading_amount_krw,
+        "daily_change": settings.min_daily_change_rate <= daily_change <= settings.max_daily_change_rate,
+        "momentum_5m": settings.min_5m_momentum_rate <= momentum_5m <= settings.max_5m_momentum_rate,
+        "momentum_15m": settings.min_15m_momentum_rate <= momentum_15m <= settings.max_15m_momentum_rate,
+        "volume": volume_surge >= settings.min_volume_surge,
+        "vwap": ZERO < over_vwap <= settings.max_price_over_vwap_rate,
+        "spread": ZERO <= spread_rate <= settings.max_spread_rate,
+        "proxy": not settings.institutional_proxy_filter or institutional_proxy_score >= settings.min_institutional_proxy_score,
+    }
+    if diagnostics is not None:
+        diagnostics.update(reasons=[key for key, passed in checks.items() if not passed],
+                           metrics={"momentum_5m": str(momentum_5m), "momentum_15m": str(momentum_15m),
+                                    "volume_surge": str(volume_surge), "vwap_distance": str(over_vwap),
+                                    "spread": str(spread_rate), "proxy": institutional_proxy_score})
+    if not all(checks.values()):
+        return None
     if not (
         settings.min_trading_amount_krw <= trading_amount
         and settings.min_daily_change_rate
@@ -549,16 +569,26 @@ def continuation_entry_evaluate(
         reasons.append("continuation_entry_score_failed")
     if evaluation.volume_score < settings.continuation_min_volume_score:
         reasons.append("continuation_volume_score_failed")
-    if (
-        evaluation.trade_pressure_score
-        < settings.continuation_min_trade_pressure_score
-    ):
-        reasons.append("continuation_trade_pressure_failed")
-    if evaluation.orderbook_score < settings.continuation_min_orderbook_score:
-        reasons.append("continuation_orderbook_failed")
+    proxy_supports = sum(
+        (
+            evaluation.trade_pressure_score
+            >= settings.continuation_min_trade_pressure_score,
+            evaluation.orderbook_score >= settings.continuation_min_orderbook_score,
+        )
+    )
+    # Order-book snapshots and inferred trade pressure are noisy individually.
+    # Require corroboration from either one, rather than rejecting a setup when
+    # the other transient proxy is weak. Volume, VWAP, breakout bounds, and the
+    # weighted entry score remain mandatory.
+    if proxy_supports < settings.continuation_min_proxy_supports:
+        reasons.append("continuation_proxy_support_failed")
     if not ZERO < vwap_distance <= settings.continuation_max_vwap_distance:
         reasons.append("continuation_vwap_distance_failed")
-    if not ZERO < breakout_distance <= settings.continuation_max_breakout_distance:
+    if not (
+        settings.continuation_min_breakout_distance
+        <= breakout_distance
+        <= settings.continuation_max_breakout_distance
+    ):
         reasons.append("continuation_breakout_distance_failed")
 
     return ContinuationEvaluation(
@@ -572,6 +602,9 @@ def continuation_entry_evaluate(
             "breakout_age_minutes": str(breakout_age) if breakout_age is not None else "",
             "vwap_distance": str(vwap_distance),
             "breakout_distance": str(breakout_distance),
+            "proxy_supports": str(proxy_supports),
+            "trade_pressure_score": str(evaluation.trade_pressure_score),
+            "orderbook_score": str(evaluation.orderbook_score),
         },
     )
 

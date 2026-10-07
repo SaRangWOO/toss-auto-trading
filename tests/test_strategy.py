@@ -65,12 +65,17 @@ def settings(root: Path) -> Settings:
         adaptive_shadow_min_score=Decimal("0.65"),
         breakout_confirmation_candles=2,
         paper_continuation_entry_enabled=True,
+        live_continuation_entry_enabled=False,
         continuation_confirmation_evaluations=2,
         continuation_breakout_max_age_minutes=10,
         continuation_min_entry_score=Decimal("0.85"),
         continuation_min_volume_score=Decimal("0.80"),
         continuation_min_trade_pressure_score=Decimal("0.55"),
         continuation_min_orderbook_score=Decimal("0.50"),
+        continuation_min_proxy_supports=1,
+        continuation_signal_min_volume_surge=Decimal("1.00"),
+        continuation_signal_min_institutional_proxy_score=2,
+        continuation_min_breakout_distance=Decimal("0.000001"),
         continuation_max_vwap_distance=Decimal("0.05"),
         continuation_max_breakout_distance=Decimal("0.015"),
         failure_exit_enabled=True,
@@ -250,6 +255,103 @@ class StrategyTests(unittest.TestCase):
             self.assertTrue(result.eligible)
             self.assertEqual(result.rejection_reasons, ())
             self.assertEqual(result.metrics["opening_hold_count"], "2")
+
+    def test_continuation_rejects_breakout_that_is_too_shallow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                settings(Path(temporary)),
+                continuation_min_breakout_distance=Decimal("0.005"),
+            )
+            candles = [
+                {
+                    "timestamp": f"2026-08-20T09:{minute:02d}:00+09:00",
+                    "highPrice": "100",
+                    "closePrice": "99",
+                    "volume": "100",
+                }
+                for minute in range(60)
+            ]
+            candles.extend(
+                [
+                    {
+                        "timestamp": "2026-08-20T10:00:00+09:00",
+                        "highPrice": "101",
+                        "closePrice": "100.5",
+                        "volume": "500",
+                    },
+                    {
+                        "timestamp": "2026-08-20T10:01:00+09:00",
+                        "highPrice": "102",
+                        "closePrice": "101.5",
+                        "volume": "600",
+                    },
+                ]
+            )
+            evaluation = AdaptiveShadowEvaluation(
+                symbol="002990",
+                live_pass=False,
+                shadow_pass=True,
+                rejection_reasons=(),
+                breakout_score=Decimal("0.93"),
+                volume_score=Decimal("1"),
+                vwap_score=Decimal("1"),
+                orderbook_score=Decimal("0.80"),
+                trade_pressure_score=Decimal("0.66"),
+                market_context_score=Decimal("1"),
+                entry_score=Decimal("0.92"),
+                metrics={
+                    "vwap_distance": "0.04",
+                    "breakout_pct": "0.004",
+                },
+            )
+            result = continuation_entry_evaluate(
+                candles,
+                evaluation,
+                config,
+                datetime.fromisoformat("2026-08-20T10:02:03+09:00"),
+            )
+            self.assertFalse(result.eligible)
+            self.assertIn("continuation_breakout_distance_failed", result.rejection_reasons)
+
+    def test_continuation_accepts_one_healthy_flow_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = settings(Path(temporary))
+            candles = [
+                {
+                    "timestamp": f"2026-08-20T09:{minute:02d}:00+09:00",
+                    "highPrice": "100",
+                    "closePrice": "99",
+                    "volume": "100",
+                }
+                for minute in range(60)
+            ] + [
+                {
+                    "timestamp": "2026-08-20T10:00:00+09:00",
+                    "highPrice": "101",
+                    "closePrice": "100.5",
+                    "volume": "500",
+                },
+                {
+                    "timestamp": "2026-08-20T10:01:00+09:00",
+                    "highPrice": "102",
+                    "closePrice": "101.5",
+                    "volume": "600",
+                },
+            ]
+            evaluation = AdaptiveShadowEvaluation(
+                "002990", False, True, (), Decimal("0.93"), Decimal("1"),
+                Decimal("1"), Decimal("0.10"), Decimal("0.66"), Decimal("1"),
+                Decimal("0.92"),
+                {"vwap_distance": "0.04", "breakout_pct": "0.012"},
+            )
+            result = continuation_entry_evaluate(
+                candles,
+                evaluation,
+                config,
+                datetime.fromisoformat("2026-08-20T10:02:03+09:00"),
+            )
+            self.assertTrue(result.eligible)
+            self.assertEqual(result.metrics["proxy_supports"], "1")
 
     def test_continuation_rejects_stale_breakout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -39,6 +39,20 @@ class ReconciliationTests(unittest.TestCase):
         self.assertIn("account_only_position:005930", reasons)
         self.assertEqual(current.sync_status, SyncStatus.DEGRADED.value)
 
+    def test_configured_manual_position_is_excluded_without_degrading_sync(self):
+        current = state()
+        reasons = reconcile_portfolio(
+            current,
+            snapshot(
+                [{"symbol": "005930", "quantity": "3", "averagePrice": "70000"}]
+            ),
+            trading_day="2026-07-29",
+            manual_holding_symbols=frozenset({"005930"}),
+        )
+        self.assertEqual(reasons, [])
+        self.assertNotIn("005930", current.positions)
+        self.assertEqual(current.sync_status, SyncStatus.SUCCEEDED.value)
+
     def test_quantity_mismatch_uses_account_quantity(self):
         current = state(position("005930", 10))
         reconcile_portfolio(current, snapshot([{"symbol": "005930", "quantity": "4", "averagePrice": "10000"}]), trading_day="2026-07-29")
