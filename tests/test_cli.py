@@ -81,6 +81,32 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.symbol, "090710")
         self.assertTrue(args.no_retry)
 
+    def test_research_commands_are_explicit_and_separate_from_runner(self) -> None:
+        backtest = build_parser().parse_args(
+            [
+                "research-backtest",
+                "--candles",
+                "research_data/minute.csv",
+                "--split-date",
+                "2026-06-01",
+            ]
+        )
+        self.assertEqual(backtest.command, "research-backtest")
+        self.assertEqual(backtest.split_date, "2026-06-01")
+        fetch = build_parser().parse_args(
+            [
+                "research-fetch-kis",
+                "--symbols",
+                "005930,000660",
+                "--start-date",
+                "2026-08-01",
+                "--end-date",
+                "2026-08-24",
+            ]
+        )
+        self.assertEqual(fetch.command, "research-fetch-kis")
+        self.assertIsNone(fetch.symbol)
+
 
 if __name__ == "__main__":
     unittest.main()

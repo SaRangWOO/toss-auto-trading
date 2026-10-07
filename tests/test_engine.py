@@ -79,6 +79,15 @@ class FakeLiveClient(FakeClient):
         return {}
 
 
+class FakeLiveClientWithManualHolding(FakeLiveClient):
+    def holdings(self) -> dict:
+        return {
+            "holdings": [
+                {"symbol": "005930", "quantity": "2", "averagePrice": "70000"}
+            ]
+        }
+
+
 def signal(symbol: str, price: str, score: str) -> MomentumSignal:
     value = Decimal(price)
     return MomentumSignal(
@@ -112,6 +121,20 @@ class EngineTests(unittest.TestCase):
                 {"securityType": "ETF", "leverageFactor": "1"}
             )
         )
+
+    def test_live_manual_holding_is_never_loaded_as_bot_position(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                settings(Path(temporary)),
+                mode="live",
+                live_confirmation=LIVE_CONFIRMATION,
+                manual_holding_symbols=frozenset({"005930"}),
+            )
+            with self.managed_engine(config, FakeLiveClientWithManualHolding()) as engine:
+                self.assertEqual(engine.state.sync_status, SyncStatus.SUCCEEDED.value)
+                self.assertNotIn("005930", engine.state.positions)
+                engine.run_once(datetime(2026, 7, 29, 8, 50, tzinfo=KST))
+                self.assertNotIn("005930", engine.state.positions)
 
     def close_engine(self, engine: TradingEngine) -> None:
         for handler in list(engine.logger.handlers):
@@ -514,6 +537,11 @@ class EngineTests(unittest.TestCase):
             Decimal("0.92"),
             {"reference_price": "15160"},
         )
+        continuation = ContinuationEvaluation(
+            True,
+            (),
+            {"breakout_age_minutes": "1.05"},
+        )
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 settings(Path(temporary)),
@@ -523,7 +551,10 @@ class EngineTests(unittest.TestCase):
             with self.managed_engine(config, LiveScanClient()) as engine:
                 with (
                     patch("toss_trader.engine.adaptive_shadow_evaluate", return_value=evaluation),
-                    patch("toss_trader.engine.continuation_entry_evaluate") as continuation_mock,
+                    patch(
+                        "toss_trader.engine.continuation_entry_evaluate",
+                        return_value=continuation,
+                    ) as continuation_mock,
                     patch("toss_trader.engine.session_breakout_allowed", return_value=False),
                     patch("toss_trader.engine.analyze_candidate") as signal_mock,
                 ):
@@ -531,8 +562,76 @@ class EngineTests(unittest.TestCase):
                         datetime(2026, 8, 20, 11, 5, 33, tzinfo=KST)
                     )
                 self.assertEqual(result, [])
-                continuation_mock.assert_not_called()
+                continuation_mock.assert_called_once()
                 signal_mock.assert_not_called()
+
+    def test_live_scan_admits_explicitly_enabled_continuation_after_confirmation(self) -> None:
+        class LiveScanClient(FakeLiveClient):
+            def rankings(self, count: int) -> list[dict]:
+                return [
+                    {
+                        "symbol": "002990",
+                        "tradingAmount": "60000000000",
+                        "price": {"lastPrice": "15160", "changeRate": "0.08"},
+                    }
+                ]
+
+            def stock_warnings(self, symbol: str) -> list[dict]:
+                return []
+
+            def candles(self, symbol: str, count: int) -> list[dict]:
+                return []
+
+            def orderbook(self, symbol: str) -> dict:
+                return {"asks": [], "bids": []}
+
+            def trades(self, symbol: str, count: int) -> list[dict]:
+                return []
+
+        evaluation = AdaptiveShadowEvaluation(
+            "002990",
+            False,
+            True,
+            (),
+            Decimal("0.93"),
+            Decimal("1"),
+            Decimal("1"),
+            Decimal("0.80"),
+            Decimal("0.66"),
+            Decimal("1"),
+            Decimal("0.92"),
+            {"reference_price": "15160"},
+        )
+        continuation = ContinuationEvaluation(True, (), {})
+        expected_signal = signal("002990", "15160", "1")
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                settings(Path(temporary)),
+                mode="live",
+                live_confirmation=LIVE_CONFIRMATION,
+                live_continuation_entry_enabled=True,
+            )
+            with self.managed_engine(config, LiveScanClient()) as engine:
+                with (
+                    patch("toss_trader.engine.adaptive_shadow_evaluate", return_value=evaluation),
+                    patch(
+                        "toss_trader.engine.continuation_entry_evaluate",
+                        return_value=continuation,
+                    ),
+                    patch("toss_trader.engine.session_breakout_allowed", return_value=False),
+                    patch(
+                        "toss_trader.engine.analyze_candidate",
+                        return_value=expected_signal,
+                    ),
+                ):
+                    first = engine.scan(
+                        datetime(2026, 8, 20, 11, 5, 3, tzinfo=KST)
+                    )
+                    second = engine.scan(
+                        datetime(2026, 8, 20, 11, 5, 33, tzinfo=KST)
+                    )
+                self.assertEqual(first, [])
+                self.assertEqual(second, [expected_signal])
 
     def test_shadow_record_contains_continuation_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

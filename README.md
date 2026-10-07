@@ -16,12 +16,26 @@
 현재 기본 운영 모드는 `paper`입니다. 실거래 경로는 계좌 상태 동기화와 이중 잠금을
 통과해야 하며, paper에서 검증 중인 전략은 live에 자동 반영되지 않습니다.
 
+**처음 오셨나요?** [처음부터 따라 하는 실행 가이드](docs/GETTING_STARTED.md)에서
+다운로드 → API 없이 테스트 → paper 연결 → 결과 확인 순서로 시작하세요.
+[폴더 안내](docs/FOLDER_GUIDE.md)는 운영 본체와 별도 개발 공간을 설명합니다.
+
+### 현재 실험과 기본 설정의 차이 (2026-10-07)
+
+공개 설정 예시는 단일 paper 모드입니다. 현재 운영에서 사용하는 **병렬 paper v2**는
+`PAPER_PARALLEL_EXPERIMENT=true`를 별도로 설정해야 켜집니다. 기존 돌파·추세 지속·
+돌파 후 재진입 세 전략을 독립 가상 계좌로 비교하며, 오전 `10:00~11:30`만 신규
+진입합니다. 정상 운용 완료 5거래일 후 신규 진입을 멈추고, 재시작해도 진행 일수를
+유지합니다. 휴장일이나 불완전한 운용일은 완료 일수에서 제외합니다.
+상세 기준은 [v2 실험 설명](docs/PARALLEL_PAPER_V2_2026-10-02.md)을 참고하세요.
+이는 수익성이 검증된 전략이나 자동 live 전환 기능이 아닙니다.
+
 ## 프로젝트 한눈에 보기
 
 | 구분 | 내용 |
 | --- | --- |
 | 대상 | 국내 주식 단기 모멘텀·돌파 후보 |
-| 데이터/주문 | Toss Securities OpenAPI REST polling |
+| 데이터/주문 | Toss Securities OpenAPI REST polling, 선택적 KIS 읽기 전용 연구 데이터 |
 | 핵심 흐름 | 종목 랭킹 → 안전·유동성 필터 → 시장 국면 → 돌파 → 적응형 점수 → 주문 |
 | 리스크 관리 | 주문 금액·보유 수·일일 진입·일일 손실 제한, stale data 차단, 강제 청산 |
 | 안정성 | single-instance lock, pending journal, 부분 체결·취소·재시작 복구, 계좌 reconciliation |
@@ -82,6 +96,13 @@ live 시작 시 보유 종목, 미체결 주문, 주문 가능 금액을 조회�
 5/10/15/30분 수익률과 MFE/MAE를 `shadow_tracking`으로 추적합니다. 전략 변경은
 단일 사례가 아니라 서로 다른 episode의 사후성과를 비교한 뒤 paper에 한정해 적용합니다.
 
+### 5. 외부 데이터로 가설을 먼저 압축
+
+과거 1분봉을 시간순으로 replay해 현재 strict 조건, Stock-in-Play, 돌파 retest,
+외인·기관 수급 확인 변형을 같은 비용 모델로 비교합니다. development/evaluation을
+날짜순으로 분리하고 다음 봉 시가로만 진입해 look-ahead를 막습니다. 결과가 좋아도
+live에는 자동 반영하지 않고 paper 실험 후보로만 표시합니다.
+
 ## 시스템 구조
 
 ```mermaid
@@ -97,9 +118,16 @@ flowchart TD
     ENGINE --> OBS[Logs · reports<br/>funnel · shadow tracking]
     LIVE --> RECON[Account reconciliation]
     RECON --> ENGINE
+    EXT[KIS read-only / licensed CSV] --> RESEARCH[Historical replay]
+    RESEARCH --> EVAL[Development · Evaluation report]
+    EVAL -->|candidate only| PAPER
 ```
 
 ## 디렉터리 구조
+
+**현재 운영 본체는 이 폴더(`auto-trading/`)입니다.** 실행은 루트의 `scripts/`만
+사용합니다. 처음 보는 분은 [폴더 안내](docs/FOLDER_GUIDE.md)를 먼저 확인하세요.
+별도 개발 브랜치 두 개는 `development-worktrees/` 안에 보존하며, 자동 실행하지 않습니다.
 
 ```text
 auto-trading/
@@ -109,6 +137,8 @@ auto-trading/
 │  ├─ config.py           # 환경 설정, 검증, live 이중 잠금
 │  ├─ engine.py           # 스캔, 리스크, 주문, 포지션, 복구 orchestration
 │  ├─ reconciliation.py   # live 계좌와 로컬 상태 동기화
+│  ├─ kis_data.py         # 선택적 KIS 분봉·수급 읽기 전용 provider
+│  ├─ research.py         # 외부 분봉 replay와 전략 변형 비교
 │  ├─ reporting.py        # 날짜별 운영 보고서
 │  ├─ state.py            # 포트폴리오·주문 상태 저장
 │  ├─ strategy.py         # 진입 점수, 수량, 청산·포지션 재평가
@@ -120,11 +150,18 @@ auto-trading/
 ├─ reports/               # 로컬 상세 진단 데이터 (Git 제외)
 ├─ logs/                  # 로컬 runner·trading 로그 (Git 제외)
 ├─ state/                 # 로컬 계좌·주문 상태 (Git 제외)
+├─ research_data/         # 외부 원천·정규화 데이터 (Git 제외)
+├─ research_output/       # replay 결과 (Git 제외)
+├─ development-worktrees/ # 별도 브랜치 개발 공간 (로컬 전용, 운영 본체 아님)
+│  ├─ live-account-sync/  # 실계좌 상태 동기화 개발 브랜치
+│  └─ market-regime-adaptive/ # 시장 국면 적응형 전략 개발 브랜치
 ├─ .env.example           # 비밀값 없는 설정 예시
 └─ pyproject.toml
 ```
 
-로컬 `.env`, `.venv/`, `logs/`, `state/`, `reports/`는 Git에서 제외됩니다.
+로컬 `.env`, `.venv/`, `logs/`, `state/`, `reports/`, `research_data/`,
+`research_output/`, `development-worktrees/`는 루트 저장소의 Git 추적에서 제외됩니다.
+개발 공간 내부의 코드는 각각 기존 Git 브랜치로 계속 관리됩니다.
 
 ## 빠른 시작
 
@@ -132,13 +169,17 @@ auto-trading/
 
 - Windows PowerShell
 - Python 3.11 이상
+- Git (저장소 복제용)
 - Toss Securities OpenAPI 사용 권한
 
 런타임 외부 패키지는 없습니다.
 
 ```powershell
+git clone https://github.com/SaRangWOO/toss-auto-trading.git auto-trading
+cd auto-trading
 .\scripts\setup.cmd
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+notepad .env
 ```
 
 `.env`에 발급받은 값을 로컬에서만 입력합니다.
@@ -165,6 +206,33 @@ LIVE_TRADING_CONFIRM=
 
 `check`, `scan`, `report`도 Toss API를 호출할 수 있습니다. `once`, `run`은 live
 설정에서 실제 주문을 만들 수 있으므로 연결 테스트 용도로 실행하면 안 됩니다.
+
+## 외부 데이터 replay
+
+한국투자 OpenAPI의 최대 1년 과거 분봉과 외인·기관 추정 집계를 주문 기능 없이
+읽기 전용으로 수집할 수 있습니다. 기본은 비활성이며 로컬 `.env`에 별도 KIS
+인증정보와 `KIS_DATA_ENABLED=true`가 있어야 명시적 research 명령이 동작합니다.
+
+```powershell
+# 과거 분봉 수집
+$env:PYTHONPATH = "$PWD\src"
+.\.venv\Scripts\python.exe -m toss_trader.cli research-fetch-kis `
+  --project-root . --symbols 005930,000660 `
+  --start-date 2026-01-02 --end-date 2026-08-24
+
+# 외인·기관 추정 snapshot 수집
+.\.venv\Scripts\python.exe -m toss_trader.cli research-fetch-flow `
+  --project-root . --symbols 005930,000660
+
+# 전략 변형 replay
+.\.venv\Scripts\python.exe -m toss_trader.cli research-backtest `
+  --project-root . --candles research_data/kis/minute_bars.csv `
+  --flows research_data/kis/flow_snapshots.csv `
+  --split-date 2026-06-01
+```
+
+상세 스키마, 데이터 권한, 비용과 승격 경계는
+[외부 데이터 연구 가이드](docs/EXTERNAL_RESEARCH.md)를 참조하세요.
 
 ## 안전한 live 활성화
 
@@ -197,6 +265,7 @@ git diff --check
 - [구현 및 안전 상태](docs/PROJECT_STATE.md)
 - [전략·운영 설계 결정](docs/DECISIONS.md)
 - [기관 수급 proxy 설계](docs/INSTITUTIONAL_PROXY.md)
+- [외부 데이터 수집·replay 가이드](docs/EXTERNAL_RESEARCH.md)
 - [주간 진입 전략 검토](docs/WEEKLY_ENTRY_REVIEW_2026-08-22.md)
 - [paper 포지션 관리 실험](docs/PAPER_POSITION_MANAGEMENT_2026-08-24.md)
 - [날짜별 운영 리포트](report/README.md)
@@ -211,6 +280,7 @@ git diff --check
 - 실제 API schema, 수수료·세금, 장 마감 강제청산은 승인된 live 환경에서 재검증이 필요합니다.
 - 주문 정정, 연속 거래손실 guard, 독립적인 전체 노출 한도, 원격 알림은 미구현입니다.
 - paper 실험을 live로 승격하기에는 서로 다른 시장 국면의 관측 표본이 더 필요합니다.
+- historical 호가·체결 틱이 없으면 외부 replay로 adaptive score 전체를 재현할 수 없습니다.
 
 ## 보안과 면책
 

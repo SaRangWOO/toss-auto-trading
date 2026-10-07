@@ -34,6 +34,21 @@ The continuation entry and 5m/10m position-management paths are evaluated only
 when `TRADING_MODE=paper`. They do not relax live startup reconciliation, fixed
 safety, liquidity, stale-data, position, daily-entry, or daily-loss guards.
 
+## External research path
+
+```text
+KIS read-only minute/flow APIs or normalized licensed CSV
+  -> research.py chronological replay
+  -> strict / Stock-in-Play / retest / flow-confirmed comparison
+  -> next-bar-open execution + modeled round-trip costs
+  -> development/evaluation report in research_output/
+  -> paper experiment candidate only (never automatic live promotion)
+```
+
+The research path is not imported by the recurring trading engine. KIS credentials
+cannot place orders because the client implements quotation endpoints only. Raw
+research datasets and generated results remain local and are ignored by Git.
+
 ## Remaining gaps
 
 Toss response schemas, account permissions, actual fees/taxes, live forced exit,

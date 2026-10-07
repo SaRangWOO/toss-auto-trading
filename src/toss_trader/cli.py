@@ -6,7 +6,7 @@ import os
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import BinaryIO
@@ -144,6 +144,138 @@ def command_report(settings: Settings) -> int:
     engine = TradingEngine(settings, _client(settings))
     path = write_daily_report(settings, engine.state, engine.client)
     print(path)
+
+
+def _research_symbols(value: str | None) -> list[str]:
+    symbols = [item.strip() for item in (value or "").split(",") if item.strip()]
+    if not symbols:
+        raise ValueError("--symbols requires at least one stock code")
+    invalid = [item for item in symbols if len(item) != 6 or not item.isalnum()]
+    if invalid:
+        raise ValueError("--symbols accepts comma-separated six-character stock codes")
+    return list(dict.fromkeys(symbols))
+
+
+def command_research_backtest(settings: Settings, args: argparse.Namespace) -> int:
+    from .research import (
+        ResearchConfig,
+        evaluate_research,
+        load_event_flags,
+        load_flow_snapshots,
+        load_minute_bars,
+        write_research_report,
+    )
+
+    if args.candles is None:
+        raise ValueError("research-backtest requires --candles")
+    split_date = date.fromisoformat(args.split_date) if args.split_date else None
+    bars = load_minute_bars(args.candles.resolve())
+    flows = load_flow_snapshots(args.flows.resolve() if args.flows else None)
+    events = load_event_flags(args.events.resolve() if args.events else None)
+    result = evaluate_research(
+        bars,
+        ResearchConfig.from_settings(settings),
+        flows=flows,
+        events=events,
+        split_date=split_date,
+    )
+    output_dir = (
+        args.output_dir.resolve()
+        if args.output_dir
+        else settings.project_root / "research_output"
+    )
+    markdown_path, json_path = write_research_report(result, output_dir)
+    print(
+        f"research replay complete bars={len(bars)} trades={len(result.trades)} "
+        f"report={markdown_path} details={json_path}"
+    )
+    print("live promotion: blocked; results can nominate a paper experiment only")
+    return 0
+
+
+def command_research_fetch_kis(settings: Settings, args: argparse.Namespace) -> int:
+    from .kis_data import (
+        MINUTE_FIELDS,
+        KisDataSettings,
+        KisResearchClient,
+        merge_csv_rows,
+    )
+
+    symbols = _research_symbols(args.symbols)
+    if not args.start_date or not args.end_date:
+        raise ValueError("research-fetch-kis requires --start-date and --end-date")
+    start = date.fromisoformat(args.start_date)
+    end = date.fromisoformat(args.end_date)
+    if end < start:
+        raise ValueError("--end-date must not be before --start-date")
+    if (end - start).days > 366:
+        raise ValueError("KIS historical minute requests are limited to a one-year range")
+    today = datetime.now(KST).date()
+    if end > today:
+        raise ValueError("--end-date must not be in the future")
+    if start < today - timedelta(days=366):
+        raise ValueError("KIS retains at most about one year of historical minute data")
+    data_settings = KisDataSettings.from_project(settings.project_root)
+    client = KisResearchClient(data_settings)
+    rows: list[dict[str, str]] = []
+    current = start
+    while current <= end:
+        if current.weekday() < 5:
+            for symbol in symbols:
+                fetched = client.minute_bars(symbol, current)
+                rows.extend(fetched)
+                print(f"KIS minute data symbol={symbol} date={current} bars={len(fetched)}")
+        current += timedelta(days=1)
+    output = (
+        args.output.resolve()
+        if args.output
+        else settings.project_root / "research_data" / "kis" / "minute_bars.csv"
+    )
+    added = merge_csv_rows(
+        output,
+        rows,
+        fields=MINUTE_FIELDS,
+        key_fields=("timestamp", "symbol"),
+    )
+    print(f"KIS read-only collection complete rows={len(rows)} added={added} output={output}")
+    return 0
+
+
+def command_research_fetch_flow(settings: Settings, args: argparse.Namespace) -> int:
+    from .kis_data import (
+        FLOW_FIELDS,
+        KisDataSettings,
+        KisResearchClient,
+        merge_csv_rows,
+        normalize_kis_flow_rows,
+    )
+
+    symbols = _research_symbols(args.symbols)
+    data_settings = KisDataSettings.from_project(settings.project_root)
+    client = KisResearchClient(data_settings)
+    observed_at = datetime.now(KST)
+    rows: list[dict[str, str]] = []
+    for symbol in symbols:
+        fetched = normalize_kis_flow_rows(
+            symbol,
+            client.investor_trend(symbol),
+            observed_at,
+        )
+        rows.extend(fetched)
+        print(f"KIS flow data symbol={symbol} snapshots={len(fetched)}")
+    output = (
+        args.output.resolve()
+        if args.output
+        else settings.project_root / "research_data" / "kis" / "flow_snapshots.csv"
+    )
+    added = merge_csv_rows(
+        output,
+        rows,
+        fields=FLOW_FIELDS,
+        key_fields=("timestamp", "symbol"),
+    )
+    print(f"KIS read-only flow collection complete rows={len(rows)} added={added} output={output}")
+    return 0
 
 
 def _save_verify_journal(
@@ -344,6 +476,9 @@ def build_parser() -> argparse.ArgumentParser:
             "status",
             "report",
             "verify-live-order",
+            "research-backtest",
+            "research-fetch-kis",
+            "research-fetch-flow",
         ),
         help=(
             "check=인증 점검, scan=후보 조회, once=1회 실행, "
@@ -363,6 +498,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-source", choices=("BEST_ASK",), default=None)
     parser.add_argument("--no-retry", action="store_true")
     parser.add_argument("--confirm", default=None)
+    parser.add_argument("--candles", type=Path, default=None)
+    parser.add_argument("--flows", type=Path, default=None)
+    parser.add_argument("--events", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--split-date", default=None)
+    parser.add_argument("--symbols", default=None)
+    parser.add_argument("--start-date", default=None)
+    parser.add_argument("--end-date", default=None)
+    parser.add_argument("--output", type=Path, default=None)
     return parser
 
 
@@ -378,6 +522,12 @@ def main() -> int:
             return command_status(settings)
         if args.command == "report":
             return command_report(settings)
+        if args.command == "research-backtest":
+            return command_research_backtest(settings, args)
+        if args.command == "research-fetch-kis":
+            return command_research_fetch_kis(settings, args)
+        if args.command == "research-fetch-flow":
+            return command_research_fetch_flow(settings, args)
         if args.command == "verify-live-order":
             if args.symbol is None or args.quantity is None or args.side is None:
                 raise ValueError("verify-live-order 필수 인자가 누락되었습니다.")
@@ -386,7 +536,11 @@ def main() -> int:
             settings.project_root / "state" / f"{settings.mode}_trader.lock"
         )
         with SingleInstanceLock(lock_path):
-            engine = TradingEngine(settings, _client(settings))
+            engine_type = TradingEngine
+            if os.getenv("PAPER_PARALLEL_EXPERIMENT", "false").lower() == "true":
+                from .experiment import ParallelPaper
+                engine_type = ParallelPaper
+            engine = engine_type(settings, _client(settings))
             if args.command == "once":
                 engine.run_once()
                 return 0

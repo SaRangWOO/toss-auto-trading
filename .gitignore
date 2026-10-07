@@ -8,4 +8,9 @@ __pycache__/
 logs/
 state/
 reports/
+research_data/
+research_output/
+
+# Local Git worktrees; each keeps its own branch and must not be nested commits.
+/development-worktrees/
 

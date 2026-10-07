@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -117,6 +118,7 @@ class TradingEngine:
         self._shadow_tracking_day: str | None = None
         self._shadow_tracking: list[dict] = []
         self._continuation_confirmations: dict[str, tuple[datetime, int]] = {}
+        self._flow_samples: dict[str, list] = {}
         if settings.mode == "live":
             self._sync_live_account(today)
 
@@ -131,7 +133,10 @@ class TradingEngine:
                 self.client.buying_power(),
             )
             reasons = reconcile_portfolio(
-                self.state, snapshot, trading_day=trading_day
+                self.state,
+                snapshot,
+                trading_day=trading_day,
+                manual_holding_symbols=self.settings.manual_holding_symbols,
             )
             if reasons:
                 self.logger.warning(
@@ -666,7 +671,7 @@ class TradingEngine:
         if self.settings.mode != "live":
             return set()
         result = self.client.holdings()
-        symbols: set[str] = set()
+        symbols: set[str] = set(self.settings.manual_holding_symbols)
 
         def collect(value: object) -> None:
             if isinstance(value, dict):
@@ -714,6 +719,10 @@ class TradingEngine:
                     "ENTRY_SKIP leveraged_inverse_etp symbol=%s", symbol
                 )
                 continue
+            if self.settings.mode == "paper" and self.settings.experiment_version == 2:
+                if Decimal(str(ranking["tradingAmount"])) < self.settings.min_trading_amount_krw:
+                    self.logger.info("ENTRY_SKIP liquidity_preselection symbol=%s", symbol)
+                    continue
             # KR orders require whole shares. Avoid expensive candidates that
             # can never fit inside the configured per-trade ceiling.
             if Decimal(str(ranking["price"]["lastPrice"])) > self.settings.max_trade_krw:
@@ -733,6 +742,40 @@ class TradingEngine:
                 )
                 continue
             final_window = now.timetz().hour >= 14
+            if self.settings.mode == "paper" and self.settings.experiment_variant in {"continuation_v2", "retest_v2"}:
+                if final_window or shadow_count >= self.settings.adaptive_shadow_max_candidates:
+                    continue
+                shadow_count += 1
+                try:
+                    from .entry_episode import evaluate_episode
+                    book = self.client.orderbook(symbol)
+                    trades = self.client.trades(symbol, count=50)
+                    evaluation, decision, samples = evaluate_episode(
+                        ranking, candles, book, trades, self.settings, now,
+                        self._flow_samples.get(symbol, []))
+                    self._flow_samples[symbol] = samples
+                    self._record_adaptive_shadow(evaluation, now, continuation=decision,
+                        continuation_confirmed=decision.eligible,
+                        continuation_confirmation_count=int(decision.metrics.get("distinct_hold_bars", "0")))
+                    if decision.eligible:
+                        config = replace(self.settings, min_5m_momentum_rate=Decimal("0"),
+                            min_15m_momentum_rate=Decimal("0"),
+                            min_volume_surge=self.settings.continuation_signal_min_volume_surge,
+                            min_institutional_proxy_score=self.settings.continuation_signal_min_institutional_proxy_score)
+                        diagnostics = {}
+                        signal = analyze_candidate(ranking, candles, book, config, as_of=now, diagnostics=diagnostics)
+                        directory = self.settings.project_root / "reports" / "signal_diagnostics"
+                        directory.mkdir(parents=True, exist_ok=True)
+                        with (directory / f"{now.date()}.jsonl").open("a", encoding="utf-8") as stream:
+                            stream.write(json.dumps({"timestamp": now.isoformat(), "symbol": symbol,
+                                "variant": self.settings.experiment_variant, "passed": signal is not None,
+                                "diagnostics": diagnostics, "episode": decision.metrics}) + "\n")
+                        if signal is not None:
+                            signals.append(signal)
+                except Exception:
+                    self._flow_samples.pop(symbol, None)
+                    self.logger.exception("EPISODE_DATA_FAILED symbol=%s", symbol)
+                continue
             shadow_orderbook = None
             continuation = None
             continuation_confirmed = False
@@ -755,8 +798,10 @@ class TradingEngine:
                         True,
                     )
                     if (
-                        self.settings.mode == "paper"
-                        and self.settings.paper_continuation_entry_enabled
+                        (
+                            self.settings.paper_continuation_entry_enabled
+                            or self.settings.live_continuation_entry_enabled
+                        )
                         and not final_window
                     ):
                         continuation = continuation_entry_evaluate(
@@ -794,14 +839,23 @@ class TradingEngine:
                 final_window,
                 self.settings.breakout_confirmation_candles,
             )
-            paper_continuation = (
+            continuation_order_path = (
                 not strict_breakout
-                and self.settings.mode == "paper"
                 and not final_window
                 and self.state.daily_entries == 0
                 and continuation_confirmed
+                and (
+                    (
+                        self.settings.mode == "paper"
+                        and self.settings.paper_continuation_entry_enabled
+                    )
+                    or (
+                        self.settings.mode == "live"
+                        and self.settings.live_continuation_entry_enabled
+                    )
+                )
             )
-            if not strict_breakout and not paper_continuation:
+            if not strict_breakout and not continuation_order_path:
                 details = ""
                 if continuation is not None:
                     details = (
@@ -817,20 +871,66 @@ class TradingEngine:
                     details,
                 )
                 continue
-            if paper_continuation:
+            if continuation_order_path:
                 self.logger.info(
-                    "ENTRY_PATH paper_continuation symbol=%s confirmation=%s/%s",
+                    "ENTRY_PATH continuation mode=%s symbol=%s confirmation=%s/%s",
+                    self.settings.mode,
                     symbol,
                     continuation_confirmation_count,
                     self.settings.continuation_confirmation_evaluations,
                 )
             orderbook = shadow_orderbook or self.client.orderbook(symbol)
+            signal_settings = self.settings
+            if continuation_order_path and self.settings.mode == "paper":
+                # This experiment relaxes only the two noisy intraday proxy
+                # gates. Operational, liquidity, spread, momentum, VWAP, risk,
+                # and sizing checks remain unchanged.
+                signal_settings = replace(
+                    self.settings,
+                    min_volume_surge=(
+                        self.settings.continuation_signal_min_volume_surge
+                    ),
+                    min_institutional_proxy_score=(
+                        self.settings.continuation_signal_min_institutional_proxy_score
+                    ),
+                )
+            variant = self.settings.experiment_variant
+            if self.settings.mode == "paper" and variant != "baseline":
+                if not continuation_confirmed:
+                    continue
+                if variant == "retest":
+                    bars = completed_intraday_candles(candles, now)
+                    level = Decimal(continuation.metrics["opening_high"])
+                    recent = bars[-5:-1]
+                    if not any(Decimal(str(b.get("lowPrice", b["closePrice"]))) <= level * Decimal("1.003")
+                               and Decimal(str(b["closePrice"])) > level for b in recent):
+                        self.logger.info("EXPERIMENT_SKIP retest_missing symbol=%s", symbol)
+                        continue
+                    if Decimal(str(bars[-1]["closePrice"])) <= Decimal(str(bars[-2]["closePrice"])):
+                        continue
+                # Only confirmed continuation replaces duplicated lower momentum
+                # thresholds. Upper extension bounds and final safety gates stay.
+                signal_settings = replace(signal_settings, min_5m_momentum_rate=Decimal("0"),
+                                          min_15m_momentum_rate=Decimal("0"),
+                                          min_volume_surge=self.settings.continuation_signal_min_volume_surge,
+                                          min_institutional_proxy_score=self.settings.continuation_signal_min_institutional_proxy_score)
+            diagnostics = {}
             signal = analyze_candidate(
-                ranking, candles, orderbook, self.settings, as_of=now
+                ranking, candles, orderbook, signal_settings, as_of=now,
+                diagnostics=diagnostics,
             )
+            path = self.settings.project_root / "reports" / "signal_diagnostics" / f"{now.date()}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"timestamp": now.isoformat(), "symbol": symbol,
+                                        "variant": variant, "passed": signal is not None,
+                                        "diagnostics": diagnostics,
+                                        "thresholds": {"m5_min": str(signal_settings.min_5m_momentum_rate),
+                                                       "m15_min": str(signal_settings.min_15m_momentum_rate),
+                                                       "volume_min": str(signal_settings.min_volume_surge)}}) + "\n")
             if signal is not None:
                 signals.append(signal)
-            elif paper_continuation:
+            elif continuation_order_path:
                 self.logger.info(
                     "ENTRY_SKIP continuation_signal_filter symbol=%s", symbol
                 )
