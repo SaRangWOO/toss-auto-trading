@@ -1,9 +1,10 @@
+param([ValidateSet('run', 'paper-lab-run')][string]$Runner = 'run', [datetime]$StartDate = [datetime]::Today)
 $ErrorActionPreference = "Stop"
 
 $taskName = "TossAutoTrading-Weekdays"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runScript = Join-Path $PSScriptRoot "run.ps1"
-$arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runScript`" run"
+$arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runScript`" $Runner"
 
 $action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
@@ -14,7 +15,8 @@ $trigger = New-ScheduledTaskTrigger `
     -Weekly `
     -WeeksInterval 1 `
     -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday `
-    -At "09:04"
+    -At "09:00"
+$trigger.StartBoundary = $StartDate.Date.AddHours(9).ToString('yyyy-MM-ddTHH:mm:ss')
 
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
@@ -44,7 +46,8 @@ Get-ScheduledTaskInfo -TaskName $taskName |
     Select-Object NextRunTime, LastRunTime, LastTaskResult
 
 $reportTaskName = "TossAutoTrading-DailyReport"
-$reportArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runScript`" report"
+$reportCommand = if ($Runner -eq 'paper-lab-run') { 'paper-lab-report' } else { 'report' }
+$reportArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runScript`" $reportCommand"
 $reportAction = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
     -Argument $reportArguments `
@@ -60,11 +63,16 @@ if (Test-Path -LiteralPath $envPath) {
     }
 }
 $reportAt = ([DateTime]::Today.Add($processStopTime)).AddMinutes(2).ToString("HH:mm")
+if ($Runner -eq 'paper-lab-run') {
+    $labPolicy = Get-Content -LiteralPath (Join-Path $projectRoot 'config/paper_lab_v3.json') -Raw | ConvertFrom-Json
+    $reportAt = ([DateTime]::Today.Add([TimeSpan]::Parse($labPolicy.stop_time))).AddMinutes(2).ToString('HH:mm')
+}
 $reportTrigger = New-ScheduledTaskTrigger `
     -Weekly `
     -WeeksInterval 1 `
     -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday `
     -At $reportAt
+$reportTrigger.StartBoundary = $StartDate.Date.Add([TimeSpan]::Parse($reportAt)).ToString('yyyy-MM-ddTHH:mm:ss')
 Register-ScheduledTask `
     -TaskName $reportTaskName `
     -Action $reportAction `
@@ -83,11 +91,11 @@ $watchdogTaskName = "TossAutoTrading-Watchdog"
 $watchdogScript = Join-Path $PSScriptRoot "watchdog.ps1"
 $watchdogAction = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$watchdogScript`"" `
+    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdogScript`"" `
     -WorkingDirectory $projectRoot
 $watchdogTrigger = New-ScheduledTaskTrigger `
     -Once `
-    -At (Get-Date).AddMinutes(1) `
+    -At ($StartDate.Date.AddHours(9)) `
     -RepetitionInterval (New-TimeSpan -Minutes 1) `
     -RepetitionDuration (New-TimeSpan -Days 365)
 Register-ScheduledTask `

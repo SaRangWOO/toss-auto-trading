@@ -13,7 +13,7 @@ Set-Content -LiteralPath $pausePath -Value "paused" -Encoding ascii
 $targets = Get-CimInstance Win32_Process |
     Where-Object {
         $_.Name -eq "python.exe" -and
-        $_.CommandLine -like "*toss_trader.cli run*" -and
+        $_.CommandLine -match 'toss_trader\.cli\s+(run|paper-lab-run)(\s|$)' -and
         $_.CommandLine -like "*$normalizedRoot*"
     } |
     Sort-Object CreationDate -Descending
@@ -26,7 +26,7 @@ Start-Sleep -Seconds 1
 $remaining = Get-CimInstance Win32_Process |
     Where-Object {
         $_.Name -eq "python.exe" -and
-        $_.CommandLine -like "*toss_trader.cli run*" -and
+        $_.CommandLine -match 'toss_trader\.cli\s+(run|paper-lab-run)(\s|$)' -and
         $_.CommandLine -like "*$normalizedRoot*"
     }
 

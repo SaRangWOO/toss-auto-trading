@@ -21,17 +21,27 @@ if (Test-Path -LiteralPath $envPath) {
     }
 }
 $heartbeatPath = Join-Path $stateDir "${mode}_heartbeat.json"
+$scheduled = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if (-not $scheduled -or $scheduled.State -eq 'Disabled') { exit 0 }
+$runnerCommand = 'run'
+if (($scheduled.Actions.Arguments -join ' ') -match '\spaper-lab-run(?:\s|$)') {
+    if ($mode -ne 'paper') { throw 'Paper lab scheduler requires paper mode' }
+    $runnerCommand = 'paper-lab-run'
+    $heartbeatPath = Join-Path $projectRoot 'reports\paper_lab_v3\heartbeat.json'
+    $labPolicy = Get-Content -LiteralPath (Join-Path $projectRoot 'config\paper_lab_v3.json') -Raw | ConvertFrom-Json
+    $processStopTime = [TimeSpan]::Parse($labPolicy.stop_time)
+}
 $normalizedRoot = [IO.Path]::GetFullPath($projectRoot).TrimEnd('\')
 $now = Get-Date
 $inWindow = $now.DayOfWeek -in @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday") -and
-    $now.TimeOfDay -ge ([TimeSpan]::Parse("09:04")) -and
+    $now.TimeOfDay -ge ([TimeSpan]::Parse("09:00")) -and
     $now.TimeOfDay -lt $processStopTime
 if (-not $inWindow -or (Test-Path -LiteralPath $pausePath)) { exit 0 }
 
 $runnerProcesses = Get-CimInstance Win32_Process |
     Where-Object {
         $_.Name -eq "python.exe" -and
-        $_.CommandLine -like "*toss_trader.cli run*" -and
+        $_.CommandLine -match ('toss_trader\.cli\s+' + [regex]::Escape($runnerCommand) + '(\s|$)') -and
         $_.CommandLine -like "*$normalizedRoot*"
     }
 $processRunning = @($runnerProcesses).Count -gt 0
@@ -39,6 +49,10 @@ $stale = $true
 if (Test-Path -LiteralPath $heartbeatPath) {
     $age = $now - (Get-Item -LiteralPath $heartbeatPath).LastWriteTime
     $stale = $age.TotalSeconds -gt 120
+}
+# Give a newly launched collector time to complete its first data batch.
+if ($processRunning -and @($runnerProcesses | Where-Object { ($now - $_.CreationDate).TotalSeconds -lt 120 }).Count -gt 0) {
+    $stale = $false
 }
 if (-not $processRunning -or $stale) {
     $stamp = $now.ToString("yyyy-MM-dd HH:mm:ss K")

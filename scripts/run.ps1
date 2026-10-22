@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("check", "scan", "once", "run", "status", "report", "verify-live-order")]
+    [ValidateSet("check", "scan", "once", "run", "status", "report", "verify-live-order", "paper-lab-once", "paper-lab-run", "paper-lab-replay", "paper-lab-report")]
     [string]$Command = "status",
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Arguments
@@ -15,7 +15,16 @@ if (-not (Test-Path -LiteralPath $python)) {
 
 $env:PYTHONPATH = Join-Path $projectRoot "src"
 $pausePath = Join-Path $projectRoot "state\watchdog.pause"
-Remove-Item -LiteralPath $pausePath -Force -ErrorAction SilentlyContinue
+# Lab is opt-in and must not silently resume the legacy scheduled runner.
+if ($Command -notlike 'paper-lab-*') {
+    Remove-Item -LiteralPath $pausePath -Force -ErrorAction SilentlyContinue
+}
+if ($Command -eq 'paper-lab-run') {
+    $scheduled = Get-ScheduledTask -TaskName 'TossAutoTrading-Weekdays' -ErrorAction SilentlyContinue
+    if ($scheduled -and ($scheduled.Actions.Arguments -join ' ') -match '\spaper-lab-run(?:\s|$)') {
+        Remove-Item -LiteralPath $pausePath -Force -ErrorAction SilentlyContinue
+    }
+}
 $logDir = Join-Path $projectRoot "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $launcherLog = Join-Path $logDir "launcher.log"

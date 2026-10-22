@@ -264,17 +264,15 @@ class TossClient:
         )
         return result.get("rankings", [])
 
-    def candles(self, symbol: str, count: int = 30) -> list[dict[str, Any]]:
+    def candles(self, symbol: str, count: int = 30, *, before: str | None = None) -> list[dict[str, Any]]:
+        query = {"symbol": symbol, "interval": "1m", "count": count, "adjusted": True}
+        if before is not None:
+            query["before"] = before
         result = self._request(
             "GET",
             "/api/v1/candles",
             "MARKET_DATA_CHART",
-            query={
-                "symbol": symbol,
-                "interval": "1m",
-                "count": count,
-                "adjusted": True,
-            },
+            query=query,
         )
         return result.get("candles", [])
 

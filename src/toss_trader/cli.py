@@ -479,6 +479,10 @@ def build_parser() -> argparse.ArgumentParser:
             "research-backtest",
             "research-fetch-kis",
             "research-fetch-flow",
+            "paper-lab-once",
+            "paper-lab-run",
+            "paper-lab-replay",
+            "paper-lab-report",
         ),
         help=(
             "check=인증 점검, scan=후보 조회, once=1회 실행, "
@@ -502,6 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flows", type=Path, default=None)
     parser.add_argument("--events", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--tapes", type=Path, default=None)
     parser.add_argument("--split-date", default=None)
     parser.add_argument("--symbols", default=None)
     parser.add_argument("--start-date", default=None)
@@ -514,6 +519,29 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         settings = Settings.from_project(args.project_root)
+        if args.command == "paper-lab-report":
+            from .paper_lab import write_lab_report
+            print(write_lab_report(settings.project_root))
+            return 0
+        if args.command == "paper-lab-replay":
+            from .paper_lab import replay_frames
+            if args.tapes is None or args.output_dir is None:
+                raise ValueError("paper-lab-replay requires --tapes and --output-dir")
+            result = replay_frames(settings, args.tapes.rglob("*.json.gz"), args.output_dir)
+            print(json.dumps(result, default=str, ensure_ascii=False))
+            return 0
+        if args.command in {"paper-lab-once", "paper-lab-run"}:
+            from .paper_lab import PaperLab
+            if settings.mode != "paper":
+                raise ValueError("Paper lab requires TRADING_MODE=paper")
+            # Share the existing runner lock: v2 and v3 cannot run concurrently.
+            with SingleInstanceLock(settings.project_root / "state" / "paper_trader.lock"):
+                lab = PaperLab(settings, _client(settings), output=args.output_dir)
+                if args.command == "paper-lab-run":
+                    lab.run_forever()
+                else:
+                    print(json.dumps(lab.run_once(), default=str, ensure_ascii=False))
+            return 0
         if args.command == "check":
             return command_check(settings)
         if args.command == "scan":

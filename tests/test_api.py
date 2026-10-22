@@ -34,6 +34,15 @@ class RecordingClient(TossClient):
 
 
 class ApiTests(unittest.TestCase):
+    def test_candle_backfill_is_read_only_and_before_is_optional(self):
+        client = RecordingClient()
+        client.candles("005930", count=30, before="2026-10-08T09:30:00+09:00")
+        self.assertEqual(client.request["method"], "GET")
+        self.assertFalse(client.request["account"])
+        self.assertEqual(client.request["query"]["before"], "2026-10-08T09:30:00+09:00")
+        client.candles("005930", count=200)
+        self.assertNotIn("before", client.request["query"])
+
     def test_gzip_error_body_is_decoded(self) -> None:
         payload = (
             '{"error":{"code":"prerequisite-required",'

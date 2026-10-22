@@ -8,6 +8,20 @@ from toss_trader.cli import SingleInstanceLock, build_parser
 
 
 class CliTests(unittest.TestCase):
+    def test_lab_scheduler_watchdog_and_report_route(self):
+        root = Path(__file__).resolve().parents[1]
+        install = (root / "scripts/install-task.ps1").read_text(encoding="utf-8")
+        watchdog = (root / "scripts/watchdog.ps1").read_text(encoding="utf-8")
+        self.assertIn("paper-lab-report", install)
+        self.assertIn("[string]$Runner", install)
+        self.assertIn("paper_lab_v3\\heartbeat.json", watchdog)
+        self.assertIn("[regex]::Escape($runnerCommand)", watchdog)
+        self.assertIn("CreationDate", watchdog)
+
+    def test_paper_lab_commands_are_explicit_opt_in(self):
+        for command in ("paper-lab-once", "paper-lab-run", "paper-lab-replay"):
+            self.assertEqual(build_parser().parse_args([command]).command, command)
+
     def test_second_instance_for_same_mode_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "paper_trader.lock"
@@ -23,7 +37,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn("Stop-ScheduledTask", script)
         self.assertIn("Stop-Process", script)
-        self.assertIn("toss_trader.cli run", script)
+        self.assertIn(r"toss_trader\.cli\s+(run|paper-lab-run)(\s|$)", script)
         self.assertIn("$normalizedRoot", script)
 
     def test_runner_persists_launcher_exit_diagnostics(self) -> None:

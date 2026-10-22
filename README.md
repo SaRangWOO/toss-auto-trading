@@ -11,7 +11,8 @@
 단순히 매수·매도 신호를 만드는 데 그치지 않고, **잘못된 주문을 내지 않는 구조**와
 **실험 결과를 재현할 수 있는 관측 체계**에 초점을 둔 개인 프로젝트입니다. 후보 탐색,
 다단계 필터링, paper/live broker 분리, 주문 복구, 일일 리스크 제한, 운영 보고서까지
-자동매매의 전체 실행 흐름을 Python 표준 라이브러리만으로 구현했습니다.
+핵심 자동매매 실행 흐름을 Python 표준 라이브러리로 구현했습니다.
+선택적 Vibe 연구 환경은 별도 Python 패키지를, Paperclip은 Node/PostgreSQL을 사용합니다.
 
 현재 기본 운영 모드는 `paper`입니다. 실거래 경로는 계좌 상태 동기화와 이중 잠금을
 통과해야 하며, paper에서 검증 중인 전략은 live에 자동 반영되지 않습니다.
@@ -20,9 +21,43 @@
 다운로드 → API 없이 테스트 → paper 연결 → 결과 확인 순서로 시작하세요.
 [폴더 안내](docs/FOLDER_GUIDE.md)는 운영 본체와 별도 개발 공간을 설명합니다.
 
-### 현재 실험과 기본 설정의 차이 (2026-10-07)
+## 현재 운용 구성 (2026-10-22)
 
-공개 설정 예시는 단일 paper 모드입니다. 현재 운영에서 사용하는 **병렬 paper v2**는
+현재 운용은 **Paper Lab v3 전용 경로**입니다. 세 전략(시초 돌파 대조군·눌림목·
+횡보 돌파)을 연구 자금/소액 예산으로 분리한 6개 가상 계좌로 비교합니다.
+09:00 수집 시작과 실제 신규 진입 허용 시각은 다릅니다. 정책의 기본 진입 구간은
+09:31~14:50, 강제 청산 시작은 15:15, 수집 종료는 15:40입니다.
+실제 유효 설정은 실행 시 생성되는 manifest에 기록하며, 정책·코드가 달라지면
+기존 실험 기록에 그대로 섞지 않습니다. [v3 상세 설명](docs/PAPER_LAB_V3.md)
+
+[Paperclip 운영·연구 분담](research/paperclip/README.md)은 기존 매매와 독립적으로
+운영 점검 → 성과 분석/탈락 분석 → 검증을 실행합니다. 로컬 Windows 프로세스 분담이며
+별도 서버 분산이나 LLM 기반 자율 운용을 의미하지 않습니다.
+
+| 무료 연구 기능 | 운용에 사용하는 근거 |
+| --- | --- |
+| 거래일지 대조 | 비용 차감 손익, 최고 수익 1/2건 제외, 비용 2배 시나리오 |
+| 조건별 탈락 분석 | 단일 조건 탈락 에피소드의 30분 후 비용 차감 관측 성과 |
+| 조건 순위 상관 | 최초 관측 시점의 거래량·상대 강도와 이후 수익률의 관계 |
+| 거래 순서 1,000회 재배열 | 같은 거래 손익에서 발생할 수 있는 실현 자산 경로의 차이 |
+
+정상 마감 확인 후 15:45부터 분석합니다. 조건 분석은 같은 정책 기간을 분리하고
+표본이 부족하면 판단을 보류합니다. 관측 수익률은 대안 포트폴리오 수익이 아니며,
+거래 순서 재배열은 미래 수익 확률을 예측하지 않습니다.
+**연결된 연구 기능은 유료 모델/API·LLM 토큰을 사용하지 않습니다.** 로컬 자원은 사용하며,
+분석 결과로 매매 설정을 자동 변경하거나 live로 전환하지 않습니다.
+
+2026-10-21: [Vibe-Trading 연구 연결](research/vibe_trading/README.md)은 기존 paper
+거래일지를 HKUDS Vibe-Trading의 분석기로 검증합니다. 별도 환경에서 계좌별
+비용 차감 손익을 대조하며, 운영 엔진의 주문·설정을 자동 변경하지 않습니다.
+
+### 이전 실험과 기본 설정의 차이 (v2 기록)
+
+2026-10-08 추가: [Paper Lab v3](docs/PAPER_LAB_V3.md)는 봉 종료 시각을 명시적으로
+처리하고, 두 독립 전략·시초 돌파 대조군을 연구 자금/실행 예산으로 나눠 비교하는
+**별도 opt-in 경로**입니다. 아래 v2 설명을 자동 대체하지 않으며 live로 전환하지 않습니다.
+
+공개 설정 예시는 단일 paper 모드입니다. 이전 **병렬 paper v2**는
 `PAPER_PARALLEL_EXPERIMENT=true`를 별도로 설정해야 켜집니다. 기존 돌파·추세 지속·
 돌파 후 재진입 세 전략을 독립 가상 계좌로 비교하며, 오전 `10:00~11:30`만 신규
 진입합니다. 정상 운용 완료 5거래일 후 신규 진입을 멈추고, 재시작해도 진행 일수를
@@ -42,7 +77,7 @@
 | 검증 | 네트워크 없는 `unittest`, paper 체결, filter funnel·shadow 사후 추적 |
 | 운영 환경 | Windows, Python 3.11+, PowerShell, Windows Task Scheduler |
 
-## 전략 파이프라인
+## 기본 엔진 전략 파이프라인 (v3와 별도)
 
 ```mermaid
 flowchart LR
@@ -144,6 +179,10 @@ auto-trading/
 │  ├─ strategy.py         # 진입 점수, 수량, 청산·포지션 재평가
 │  └─ cli.py              # CLI와 single-instance runner
 ├─ tests/                 # 네트워크를 사용하지 않는 unittest
+├─ config/paper_lab_v3.json # v3 기본 실험 정책
+├─ research/
+│  ├─ vibe_trading/       # 고정 upstream 분석 함수 연결·설치·연구 안내
+│  └─ paperclip/          # 로컬 운영/성과/연구/검증 담당
 ├─ scripts/               # 설치, 실행, 예약 작업, watchdog, 비상 정지
 ├─ docs/                  # 아키텍처, 설계 결정, 실험·운영 검토
 ├─ report/                # Git에 보존하는 소형 날짜별 운영 보고서
@@ -172,7 +211,7 @@ auto-trading/
 - Git (저장소 복제용)
 - Toss Securities OpenAPI 사용 권한
 
-런타임 외부 패키지는 없습니다.
+기본 매매 런타임에는 외부 패키지가 없습니다. 선택적 연구 환경은 별도 설치합니다.
 
 ```powershell
 git clone https://github.com/SaRangWOO/toss-auto-trading.git auto-trading
@@ -208,6 +247,30 @@ LIVE_TRADING_CONFIRM=
 설정에서 실제 주문을 만들 수 있으므로 연결 테스트 용도로 실행하면 안 됩니다.
 
 ## 외부 데이터 replay
+
+### Paper v3와 무료 연구 실행
+
+기본 설치와 API 설정 후 아래 명령을 사용합니다. v3는 paper 전용이며,
+기존 실험 manifest가 불일치하면 초기화하거나 덮어쓰지 말고 원인을 확인합니다.
+
+```powershell
+.\scripts\run.cmd paper-lab-run
+# 장 마감 후 별도 터미널에서 보고서 생성
+.\scripts\run.cmd paper-lab-report
+# 선택 사항: 검증 환경 Python 3.13, Git 및 패키지 다운로드 연결 필요
+.\research\vibe_trading\setup.ps1
+# YYYY-MM-DD를 실제 수집 완료일로, 출력 폴더를 새 경로로 변경
+.\research_data\vibe-trading\venv\Scripts\python.exe research/vibe_trading/free_research.py --through YYYY-MM-DD --output research_output/vibe-trading/new-review
+```
+
+결과는 지정 폴더의 `REPORT.md`, `analysis.json`, `episodes.json`입니다.
+Paperclip이 구성된 운영 VM에서는 이 분석이 자동 실행되고,
+`research_output/paperclip/YYYY-MM-DD/research-v2.json`과 `validation-v2.json`에서
+보고서 경로를 확인할 수 있습니다. Paperclip 서버 설치본·DB·로컬 런타임 설정은
+저장소에 포함하지 않습니다. 새 PC에서 `install-task.ps1`만 실행하면 서버가
+설치되는 것은 아닙니다. [구성 전제와 운영 안내](research/paperclip/README.md)
+
+### KIS 읽기 전용 연구
 
 한국투자 OpenAPI의 최대 1년 과거 분봉과 외인·기관 추정 집계를 주문 기능 없이
 읽기 전용으로 수집할 수 있습니다. 기본은 비활성이며 로컬 `.env`에 별도 KIS
@@ -251,7 +314,7 @@ live startup reconciliation도 모두 정상이어야 신규 진입이 허용됩
 
 ```powershell
 $env:PYTHONPATH = "$PWD\src"
-.\.venv\Scripts\python.exe -m compileall -q src tests
+.\.venv\Scripts\python.exe -m compileall -q src tests research
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 git diff --check
 ```
